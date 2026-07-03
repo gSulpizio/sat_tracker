@@ -58,6 +58,9 @@ def build_detector(backend: str, cfg=None) -> VesselDetector:
     if backend == "roboflow":
         from backend.detection.hosted_api import RoboflowDetector
         return RoboflowDetector(api_key=cfg.roboflow_api_key, model_id=cfg.roboflow_model_id)
+    if backend == "replicate":
+        from backend.detection.replicate_api import ReplicateDetector
+        return ReplicateDetector(cfg=cfg)
     if backend == "vertex":
         from backend.detection.hosted_api import VertexAIDetector
         return VertexAIDetector()

@@ -359,6 +359,7 @@ def _detector_model(cfg: Settings) -> str:
     return {
         "yolo": cfg.yolo_weights,
         "roboflow": cfg.roboflow_model_id,
+        "replicate": cfg.replicate_model,
     }.get(cfg.detector_backend, cfg.detector_backend)
 
 

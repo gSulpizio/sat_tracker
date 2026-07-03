@@ -214,6 +214,35 @@ minutes (forcing a reconnect), so adding or removing a location in the
 app takes effect without restarting the collector. Pass `AOI_BBOX` (or
 `--bbox` on the CLI) to pin it to one explicit area instead.
 
+## Self-Hosted Detector on Replicate (recommended)
+
+`replicate_xview3/` packages the **xView3 challenge 2nd-place model**
+(selimsef's TimmUnet-resnet34, Apache-2.0) for Replicate: purpose-built
+for Sentinel-1 dark-vessel detection, takes native-resolution VV+VH dB
+chips, and returns per-target center, vessel/non-vessel classification,
+and **length in metres** in a single forward pass. Replicate bills
+per-second with scale-to-zero, so this bursty on-demand pipeline costs
+cents per month — no credit blocks, no idle GPU.
+
+Deploy once:
+
+```bash
+# weights (97 MB): official challenge release
+curl -L -o replicate_xview3/model.bin \
+  https://github.com/selimsef/xview3_solution/releases/download/weights/val_only_TimmUnet_resnet34_77_xview
+# create the model page (private, CPU) via replicate.com or the API, then:
+cd replicate_xview3
+docker login r8.im -u <username>   # password = your API token
+cog push r8.im/<username>/<model-name>
+```
+
+Then set detector backend `replicate` + token + `owner/name` in the app.
+The client (backend/detection/replicate_api.py) tiles the AOI into
+800×800 native chips, pseudo-calibrates DN→σ0 by anchoring the 30th
+percentile to calm-sea levels, uploads via Replicate's Files API, and
+dedupes across chip/frame overlaps. Model-provided lengths take
+precedence; the local measurement module fills any gaps.
+
 ## Model Training Notes (YOLOv8-OBB for SAR)
 
 Public SAR ship datasets suitable for fine-tuning:

@@ -178,11 +178,18 @@ def config_panel() -> None:
                      "known ground truth, for testing only. All outputs are "
                      "flagged and shown under a large red SIMULATED banner.",
             )
-            backends = ["yolo", "roboflow", "vertex", "mock"]
+            backends = ["replicate", "yolo", "roboflow", "vertex", "mock"]
             backend = st.selectbox(
                 "Detector backend", backends,
-                index=backends.index(default("detector_backend")),
+                index=backends.index(default("detector_backend"))
+                if default("detector_backend") in backends else 0,
                 help="Which model finds ships in the SAR image:\n\n"
+                     "- **replicate** — the xView3 challenge 2nd-place model "
+                     "(purpose-built for Sentinel-1 dark-vessel detection; "
+                     "also estimates vessel length directly), self-hosted on "
+                     "Replicate via this repo's replicate_xview3/ package. "
+                     "Pay-per-second with scale-to-zero: cents/month at this "
+                     "workload. Reads native-resolution VV+VH imagery.\n"
                      "- **yolo** — open-source YOLOv8-OBB running locally. Free, "
                      "private, needs `pip install ultralytics`, trained weights, "
                      "and ideally a GPU.\n"
@@ -461,6 +468,21 @@ def config_panel() -> None:
                      "used when the detector backend is 'roboflow'.",
             )
 
+            repl_token = st.text_input(
+                "Replicate API token", saved.replicate_api_token, type="password",
+                help="Token from replicate.com/account/api-tokens. Only used "
+                     "when the detector backend is 'replicate'. Saved with "
+                     "the rest of the config to data/user_config.json — "
+                     "git-ignored, file permissions 0600, local machine only.",
+            )
+            repl_model = st.text_input(
+                "Replicate model (owner/name)", saved.replicate_model,
+                help="The model pushed from this repo's replicate_xview3/ "
+                     "package, in 'owner/name' form exactly as shown on its "
+                     "Replicate page (e.g. 'youruser/xview3-vessel-detect'). "
+                     "Only used when the detector backend is 'replicate'.",
+            )
+
             submitted = st.form_submit_button("▶ Run pipeline", use_container_width=True)
 
         if have_saved and st.button(
@@ -516,6 +538,8 @@ def config_panel() -> None:
             yolo_weights=yolo_w or saved.yolo_weights,
             roboflow_api_key=rf_key,
             roboflow_model_id=normalize_roboflow_model_id(rf_model) or saved.roboflow_model_id,
+            replicate_api_token=repl_token,
+            replicate_model=repl_model.strip().strip("/"),
         )
         # Persist before running: even a failed attempt (bad credentials,
         # empty search window) keeps what was typed for the next session.

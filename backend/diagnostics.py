@@ -207,6 +207,49 @@ def _check_rest(cfg: Settings) -> CheckResult:
 
 def check_detector(cfg: Settings) -> CheckResult:
     t0 = time.monotonic()
+    if cfg.detector_backend == "replicate":
+        try:
+            import requests
+
+            if not cfg.replicate_api_token:
+                return CheckResult("Detector (Replicate)", False,
+                                   "API token not set — replicate.com/account/api-tokens")
+            if not cfg.replicate_model or "/" not in cfg.replicate_model:
+                return CheckResult("Detector (Replicate)", False,
+                                   "model not set — use 'owner/name'")
+            r = requests.get(
+                f"https://api.replicate.com/v1/models/{cfg.replicate_model}",
+                headers={"Authorization": f"Bearer {cfg.replicate_api_token}"},
+                timeout=30,
+            )
+            if r.status_code == 401:
+                return CheckResult("Detector (Replicate)", False,
+                                   "token rejected (401) — regenerate at "
+                                   "replicate.com/account/api-tokens",
+                                   time.monotonic() - t0)
+            if r.status_code == 404:
+                return CheckResult("Detector (Replicate)", False,
+                                   f"model '{cfg.replicate_model}' not found — "
+                                   "check owner/name, and that the token "
+                                   "belongs to the owning account",
+                                   time.monotonic() - t0)
+            r.raise_for_status()
+            version = (r.json().get("latest_version") or {}).get("id")
+            if not version:
+                return CheckResult("Detector (Replicate)", False,
+                                   f"model '{cfg.replicate_model}' exists but "
+                                   "has no pushed version yet — wait for/rerun "
+                                   "`cog push` (see replicate_xview3/cog.yaml)",
+                                   time.monotonic() - t0)
+            return CheckResult("Detector (Replicate)", True,
+                               f"model '{cfg.replicate_model}' reachable, "
+                               f"version {version[:8]}… (metadata check only — "
+                               "no billable inference run)",
+                               time.monotonic() - t0)
+        except Exception as exc:
+            return CheckResult("Detector (Replicate)", False,
+                               f"{type(exc).__name__}: {str(exc)[:160]}",
+                               time.monotonic() - t0)
     if cfg.detector_backend == "roboflow":
         try:
             import base64

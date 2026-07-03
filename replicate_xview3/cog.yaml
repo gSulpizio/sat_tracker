@@ -1,0 +1,18 @@
+# Cog package for the xView3 2nd-place dark-vessel detector (single
+# resnet34 TimmUnet fold), served on Replicate CPU hardware — the
+# workload is bursty/on-demand so per-second scale-to-zero CPU billing
+# beats any dedicated GPU by orders of magnitude.
+#
+# Build & push (weights file model.bin must sit in this directory;
+# download: https://github.com/selimsef/xview3_solution/releases/download/weights/val_only_TimmUnet_resnet34_77_xview):
+#   cog login
+#   cog push r8.im/<owner>/<model-name>
+build:
+  gpu: false
+  python_version: "3.11"
+  python_packages:
+    - torch==2.4.1
+    - timm==1.0.11
+    - numpy<2
+    - scipy>=1.11
+predict: "predict.py:Predictor"

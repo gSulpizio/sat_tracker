@@ -67,7 +67,13 @@ class Settings:
     ais_api_key: str = os.getenv("AIS_API_KEY", "")     # REST bearer / aisstream key
     ais_store_dir: Path = AIS_STORE_DIR
 
-    # Detection backend: "yolo" | "roboflow" | "vertex" ("mock": simulate only)
+    # Replicate-hosted detector (xView3 2nd-place model packaged in
+    # replicate_xview3/) — pay-per-second, scale-to-zero
+    replicate_api_token: str = os.getenv("REPLICATE_API_TOKEN", "")
+    replicate_model: str = os.getenv("REPLICATE_MODEL", "")
+
+    # Detection backend: "replicate" | "yolo" | "roboflow" | "vertex"
+    # ("mock": simulate only)
     detector_backend: str = os.getenv("DETECTOR_BACKEND", "yolo")
     yolo_weights: str = os.getenv("YOLO_WEIGHTS", "models/yolov8m-obb-sar.pt")
     roboflow_api_key: str = os.getenv("ROBOFLOW_API_KEY", "")
@@ -123,6 +129,7 @@ _PERSISTED_FIELDS = (
     "ais_provider", "ais_api_url", "ais_api_key",
     "detector_backend", "yolo_weights",
     "roboflow_api_key", "roboflow_model_id",
+    "replicate_api_token", "replicate_model",
     "temporal_window_s", "match_gate_m",
     "search_days", "max_scenes", "aoi_bbox",
     "include_s2", "s2_max_cloud", "measure_lengths",

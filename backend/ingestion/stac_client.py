@@ -56,6 +56,9 @@ class Scene:
     crs: str                        # CRS of `image` pixel grid
     image: np.ndarray               # 2-D float array, SAR backscatter in dB
     asset_href: str
+    # Every frame of the pass (mosaicked passes have several) — needed by
+    # detectors/measurement that re-read native-resolution windows.
+    asset_hrefs: list[str] | None = None
 
     @property
     def transform_params(self) -> tuple[float, float, float, float]:
@@ -246,7 +249,23 @@ def load_scene(refs: list[SceneRef], bbox: BBox, cfg: Settings | None = None) ->
         crs="EPSG:4326",
         image=canvas,
         asset_href=first.asset_href,
+        asset_hrefs=[r.asset_href for r in refs],
     )
+
+
+def sibling_polarization_href(href: str, pol: str = "vh") -> list[str]:
+    """Candidate hrefs for the other polarization of the same acquisition.
+
+    CDSE GRD-COG measurement files encode polarization and a band index in
+    the filename (…-grd-vv-…-001-cog.tiff / …-grd-vh-…-002-cog.tiff); the
+    band number isn't predictable, so return candidates for the caller to
+    try opening in order.
+    """
+    import re
+
+    swapped = re.sub(r"-(vv|vh)-", f"-{pol}-", href)
+    return [re.sub(r"-(\d{3})-cog\.tiff$", f"-{num}-cog.tiff", swapped)
+            for num in ("001", "002", "003")]
 
 
 # --------------------------------------------------------------------------
