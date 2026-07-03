@@ -1,260 +1,186 @@
-# sat_tracker — Dark Vessel Detection Platform
+# sat_tracker — Dark Vessel Detection
 
-Fuses Sentinel-1 SAR imagery with AIS tracking data to surface **dark vessels**:
-ships visible on radar that are not broadcasting AIS. Includes a web GIS
-dashboard with human-in-the-loop correction (add / delete / re-link targets).
+Find ships that don't want to be found. **sat_tracker** fuses Sentinel-1
+radar imagery with live AIS tracking data to surface **dark vessels** —
+ships visible on satellite radar that are not broadcasting their position —
+and puts the result on an interactive map with human-in-the-loop review.
 
----
+![Sentinel-1 radar image of the Strait of Gibraltar — each bright point on the water is a ship](docs/sar_strait_of_gibraltar.jpg)
+*Sentinel-1 VV backscatter over the Strait of Gibraltar. Bright crosses on
+dark water are ships. Contains modified Copernicus Sentinel data.*
 
-## Step 1 — System Architecture & Data Flow
+## What it does
 
-```mermaid
-flowchart TB
-    subgraph SOURCES["External Data Sources"]
-        CDSE["Copernicus Data Space<br/>STAC API (Sentinel-1 GRD COGs)"]
-        S2["Sentinel-2 L2A<br/>(optional optical overlay)"]
-        AIS["AIS Feed<br/>(JSON/CSV — MMSI, lat/lon, SOG, COG, ts)"]
-    end
+- **Finds every Sentinel-1 pass** over your area of interest and streams
+  only the needed pixels (windowed COG reads — no scene downloads).
+- **Detects ships** with the [xView3 challenge](https://iuu.xview.us/)
+  2nd-place model — purpose-built for exactly this problem — including
+  per-vessel **length estimation**, served pay-per-second on Replicate
+  (a full pass costs a few cents; scale-to-zero, no idle cost).
+- **Records AIS continuously** from [aisstream.io](https://aisstream.io)
+  (free) for every area you bookmark, in one lightweight process.
+- **Fuses radar × AIS**: dead-reckons every AIS track to the exact image
+  timestamp (WGS84 geodesics), solves the optimal detection↔track
+  assignment (Hungarian algorithm, 1 km gate), and classifies each target:
+  🔵 verified (radar + AIS) · 🟢 AIS-only (broadcasting, not imaged) ·
+  🔴 **dark** (imaged, silent).
+- **Measures ship sizes** (~length × beam + axis orientation) from
+  native-resolution radar chips, independent of detector backend.
+- **Interactive review**: multi-pass navigation, Sentinel-2 optical context
+  overlay, click-to-delete false positives, click-to-link missed matches,
+  draw-on-map areas of interest with named bookmarks, per-pass corrections
+  with an exportable audit trail (usable as retraining labels).
+- **Honest by design**: per-pass AOI-coverage %, AIS time-alignment
+  diagnostics with root-cause messages, a data-source health panel, and an
+  unmissable red banner on anything simulated.
 
-    subgraph INGEST["Ingestion Layer  (backend/ingestion)"]
-        STACC["stac_client.py<br/>STAC search → COG windowed reads<br/>(rasterio /vsicurl, no full download)"]
-        AISL["ais_loader.py<br/>normalize → validate → dedupe pings"]
-    end
-
-    subgraph ML["Detection Layer  (backend/detection)"]
-        PRE["SAR preprocessing<br/>calibration → dB → land mask"]
-        DET["VesselDetector interface"]
-        YOLO["YOLOv8-OBB<br/>(open source, local GPU)"]
-        HOSTED["Hosted adapter<br/>(Roboflow / Vertex AI / Bedrock)"]
-        DET --> YOLO
-        DET --> HOSTED
-    end
-
-    subgraph FUSION["Fusion Layer  (backend/fusion)"]
-        DR["Dead-reckoning:<br/>project AIS to T_img via SOG/COG<br/>(Δt ≤ ±5 min)"]
-        HUNG["Hungarian assignment<br/>geodesic cost matrix, 1 km gate"]
-        CLS["Classify:<br/>VERIFIED / AIS_ONLY / DARK"]
-        DR --> HUNG --> CLS
-    end
-
-    subgraph STORE["Storage"]
-        PG[("PostgreSQL + PostGIS<br/>scenes · ais_pings · detections<br/>fusion_results · corrections")]
-    end
-
-    subgraph API["Serving"]
-        FAST["FastAPI (optional) /<br/>snapshot JSON payloads"]
-    end
-
-    subgraph UI["Frontend  (app/streamlit_app.py)"]
-        MAP["Folium map canvas<br/>OSM + S1 SAR + S2 RGB toggles"]
-        MARK["Blue = verified<br/>Green = AIS only<br/>Red = dark vessel"]
-        CRUD["Human-in-the-loop:<br/>add · delete · re-link"]
-        STATS["Analytics panel<br/>dark fleet ratio"]
-    end
-
-    CDSE --> STACC
-    S2 --> STACC
-    AIS --> AISL
-    STACC --> PRE --> DET
-    AISL --> DR
-    DET --> HUNG
-    CLS --> PG
-    PG --> FAST --> MAP
-    MAP --- MARK
-    MAP --- CRUD
-    CRUD -- "corrections audit trail" --> PG
-    MAP --- STATS
-```
-
-**Data flow summary**
-
-1. A STAC query against the Copernicus Data Space Ecosystem returns Sentinel-1
-   GRD scenes intersecting the AOI/time window; imagery is read as COG windows
-   (`rasterio` over `/vsicurl/`) so only the AOI pixels are transferred.
-2. SAR chips are preprocessed (σ⁰ calibration, dB scaling, coastline land
-   masking) and passed to the `VesselDetector` interface — either a local
-   YOLOv8-OBB model or a hosted inference API, selected by config.
-3. AIS pings within ±5 min of the scene timestamp are dead-reckoned to the
-   image acquisition time using each vessel's SOG/COG.
-4. A Hungarian (linear sum assignment) solve matches radar detections to
-   projected AIS positions on a geodesic-distance cost matrix, gated at 1 km.
-5. Results are classified **VERIFIED** (blue), **AIS_ONLY** (green),
-   **DARK** (red), persisted to PostGIS, and served to the dashboard.
-6. Analyst corrections (add / delete / re-link) are written back as an audit
-   trail and can be exported as training labels for model fine-tuning.
-
----
-
-## Repository Layout
-
-```
-sat_tracker/
-├── backend/
-│   ├── config.py                 # env-driven settings
-│   ├── pipeline.py               # Step 2: end-to-end fusion pipeline (entry point)
-│   ├── ingestion/
-│   │   ├── stac_client.py        # Copernicus STAC search + COG reads (+ offline simulator)
-│   │   └── ais_loader.py         # AIS CSV/JSON ingestion + mock generator
-│   ├── detection/
-│   │   ├── base.py               # VesselDetector interface + Detection dataclass
-│   │   ├── yolo_sar.py           # YOLOv8-OBB open-source implementation
-│   │   └── hosted_api.py         # Roboflow / Vertex AI drop-in adapters
-│   └── fusion/
-│       └── matcher.py            # dead reckoning + Hungarian matching
-├── app/
-│   └── streamlit_app.py          # Step 3: interactive GIS dashboard
-├── db/
-│   └── schema.sql                # PostGIS schema
-├── data/                         # generated snapshots + rendered SAR overlay
-└── requirements.txt
-```
-
-## Quick Start
+## Quick start
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-streamlit run app/streamlit_app.py
-```
-
-**Every option is configurable in the app** (sidebar → ⚙️ Pipeline
-configuration): data mode, detector backend, temporal window, match gate,
-AOI bbox, AIS provider, STAC catalog/collection, and credentials. Hit
-**▶ Run pipeline** to fetch, detect, fuse, and render.
-
-**Configuration persists between sessions:** every run saves the full panel
-(credentials included) to `data/user_config.json`, and the app — and the
-CLI — start from it next time. The file is git-ignored (all of `data/` is)
-and written with `0600` permissions since it holds API secrets. A
-*Clear saved config* button in the panel deletes it.
-
-### Multi-pass snapshots
-
-The pipeline processes **every Sentinel-1 pass** found in the search window
-(up to *Max passes per run*) and writes one snapshot per pass to
-`data/snapshots/`. The dashboard navigates between passes with **◀ / ▶** —
-each pass carries its own scene, its own AIS window (fetched ±Δt around that
-pass's acquisition time), its own fusion result, and its own analyst
-corrections (edits persist while navigating).
-
-### AIS providers (API instead of manual upload)
-
-| Provider | What it is | Setup |
-|---|---|---|
-| `store` (default) | Local recording fed by the **aisstream.io collector daemon**. Live AIS can't be queried retroactively on free tiers, so you record continuously and the pipeline queries the recording per pass. | `pip install websockets`, free key from aisstream.io, then run `python -m backend.ingestion.ais_collector --bbox -6.2 35.75 -5.3 36.2` as a daemon |
-| `rest` | One HTTP call per pass to a historical AIS API (Datalastic, Spire, in-house). | Set the URL template (placeholders `{min_lon} {min_lat} {max_lon} {max_lat} {start_iso} {end_iso}`) + API key in the app |
-| `file` | Manual CSV/JSON upload — fallback. An uploaded file always overrides the API, and the scene search window is derived from its time coverage. | Upload in the sidebar |
-
-### Live mode (default) — real data only
-
-- Uses the configured AIS provider automatically. For imagery from the
-  default Copernicus Data Space catalog you need **CDSE S3 keys**
-  (`CDSE_S3_KEY` / `CDSE_S3_SECRET`, generated at
-  [eodata-s3keysmanager.dataspace.copernicus.eu](https://eodata-s3keysmanager.dataspace.copernicus.eu))
-  — the GRD-COG assets are streamed from `s3://eodata`. The OAuth client
-  (`CDSE_CLIENT_ID` / `CDSE_CLIENT_SECRET`) is only needed for catalogs
-  serving token-protected HTTPS assets. GRD-COG products carry ground
-  control points; the reader warps them to EPSG:4326 on the fly (accurate
-  over ocean).
-- Per pass, AIS is fetched for ±Δt around that scene's acquisition time, so
-  image time and AIS time coincide by construction. Each snapshot's
-  `time_alignment` block records T_img vs. AIS coverage and how many
-  pings/vessels are usable; the dashboard shows an error banner if empty.
-- Requires a real detector backend (`yolo` needs `pip install ultralytics`
-  + trained weights; or `roboflow` / `vertex` with API credentials). The
-  mock detector is rejected in live mode.
-
-```bash
-python -m backend.pipeline                                  # AIS from store/API
-python -m backend.pipeline --ais fleet_export.csv           # AIS from a file
-```
-
-### Simulate mode — testing only
-
-Fabricates a synthetic scene + AIS traffic with known ground truth. All
-outputs are unmistakably labeled: `scene_id` starts with `SIMULATED_`, the
-payload carries `"simulated": true`, and the dashboard renders a large red
-**⚠ SIMULATED DATA ⚠** banner.
-
-```bash
-python -m backend.pipeline --mode simulate                  # mock detector
-python -m backend.pipeline --mode simulate --ais old.csv    # scene time auto-aligns to the file
-```
-
-## Docker Deployment
-
-Two long-running services (`docker-compose.yml`), built from one shared image:
-
-- **`sat-tracker`** — the Streamlit dashboard. A plain idle web server; the
-  only heavy work (imagery download, detector API calls) runs on-demand
-  when an analyst clicks ▶ Run pipeline, never on a schedule.
-- **`sat-tracker-collector`** — the AIS websocket listener
-  (`backend/ingestion/ais_collector.py`). Needs to run continuously since
-  fusion depends on a ping history, but it's idle almost all the time
-  (waiting on the socket) — negligible CPU, tens of MB of RAM.
-
-Both carry hard `mem_limit`/`cpus` ceilings so neither a heavy manual
-pipeline run nor a runaway process can starve the host.
-
-```bash
+git clone https://github.com/gSulpizio/sat_tracker && cd sat_tracker
+cp .env.example .env        # fill in the three credentials below
 docker compose up -d --build
+# → http://localhost:8501
 ```
 
-Config (`data/user_config.json`, credentials, `data/locations.json`,
-the AIS store, cached snapshots) lives on a bind-mounted volume — set
-`SAT_TRACKER_DATA_DIR` or edit the `volumes:` path in `docker-compose.yml`
-to point at wherever that should persist on the host. The collector reads
-its API key from env (`AIS_API_KEY`) via an `.env` file next to the data
-directory. By default it watches **every area saved under 📍 Saved
-locations** — aisstream accepts multiple bounding boxes in one
-subscription, so one process/websocket covers all of them at once rather
-than needing a container per location. The list is re-read every 15
-minutes (forcing a reconnect), so adding or removing a location in the
-app takes effect without restarting the collector. Pass `AOI_BBOX` (or
-`--bbox` on the CLI) to pin it to one explicit area instead.
+Or without Docker: `pip install -r requirements.txt`, then
+`streamlit run app/streamlit_app.py`. Every setting (including all
+credentials) can also be entered in the app's ⚙️ Pipeline configuration
+panel, which persists them to `data/user_config.json` (git-ignored,
+0600) across restarts.
 
-## Self-Hosted Detector on Replicate (recommended)
+To try it with zero credentials: pick **simulate** mode in the config
+panel — a synthetic scene + AIS traffic with known ground truth, rendered
+under a large SIMULATED banner.
 
-`replicate_xview3/` packages the **xView3 challenge 2nd-place model**
-(selimsef's TimmUnet-resnet34, Apache-2.0) for Replicate: purpose-built
-for Sentinel-1 dark-vessel detection, takes native-resolution VV+VH dB
-chips, and returns per-target center, vessel/non-vessel classification,
-and **length in metres** in a single forward pass. Replicate bills
-per-second with scale-to-zero, so this bursty on-demand pipeline costs
-cents per month — no credit blocks, no idle GPU.
+## Credentials you need (all free to obtain)
 
-Deploy once:
+| What | Where | Used for |
+|---|---|---|
+| CDSE **S3 keys** | [eodata-s3keysmanager.dataspace.copernicus.eu](https://eodata-s3keysmanager.dataspace.copernicus.eu) (free Copernicus account) | streaming Sentinel-1/-2 imagery windows. Note: this is a *different* credential than the CDSE OAuth client. |
+| aisstream.io key | [aisstream.io](https://aisstream.io) | live AIS recording. Free terrestrial feed — coverage is volunteer-receiver based and has regional gaps; the app tells you when a gap, not a dark fleet, explains an all-dark pass. |
+| Replicate token | [replicate.com/account/api-tokens](https://replicate.com/account/api-tokens) | ship detection. Billed to your account per second of CPU: ~$0.03–0.05 per satellite pass at typical AOI sizes. |
+
+## Detection backends
+
+The default is **`replicate`**, pointing at
+[`gsulpizio/xview3-vessel-detect`](https://replicate.com/gsulpizio/xview3-vessel-detect)
+— a public deployment of the xView3 2nd-place model (Selim Seferbekov's
+TimmUnet-resnet34, Apache-2.0). It consumes native-resolution VV+VH chips
+and returns, per target: position, vessel/non-vessel classification, and
+length in metres. You only need your own Replicate token.
+
+Prefer full control? The complete Cog package is in `replicate_xview3/`
+(weights are **not** in this repo — the model is fetched from the
+[official challenge release](https://github.com/selimsef/xview3_solution/releases/tag/weights)):
 
 ```bash
-# weights (97 MB): official challenge release
 curl -L -o replicate_xview3/model.bin \
   https://github.com/selimsef/xview3_solution/releases/download/weights/val_only_TimmUnet_resnet34_77_xview
-# create the model page (private, CPU) via replicate.com or the API, then:
 cd replicate_xview3
-docker login r8.im -u <username>   # password = your API token
-cog push r8.im/<username>/<model-name>
+docker login r8.im -u <your-replicate-username>   # password = API token
+cog push r8.im/<your-username>/<model-name>
 ```
 
-Then set detector backend `replicate` + token + `owner/name` in the app.
-The client (backend/detection/replicate_api.py) tiles the AOI into
-800×800 native chips, pseudo-calibrates DN→σ0 by anchoring the 30th
-percentile to calm-sea levels, uploads via Replicate's Files API, and
-dedupes across chip/frame overlaps. Model-provided lengths take
-precedence; the local measurement module fills any gaps.
+Other backends, selectable in the app: `roboflow` (hosted API, works with
+any model you train there or public Universe models), `yolo` (local
+YOLOv8-OBB — see training notes below), `vertex` (Google Cloud endpoint),
+and `mock` (simulate mode only).
 
-## Model Training Notes (YOLOv8-OBB for SAR)
+## How it works
 
-Public SAR ship datasets suitable for fine-tuning:
+```mermaid
+flowchart LR
+    subgraph SOURCES["Data sources"]
+        CDSE["Copernicus STAC<br/>S1 GRD + S2 L2A COGs"]
+        AIS["aisstream.io /<br/>REST API / CSV"]
+    end
+    subgraph PIPELINE["Per satellite pass"]
+        READ["windowed COG reads<br/>frame mosaicking, GCP→EPSG:4326"]
+        DET["ship detection<br/>(Replicate / Roboflow / YOLO)"]
+        SIZE["native-res size<br/>measurement"]
+        DR["AIS dead reckoning<br/>to image time"]
+        HUNG["Hungarian matching<br/>1 km geodesic gate"]
+    end
+    UI["Streamlit + Leaflet dashboard<br/>multi-pass · corrections · analytics"]
+    CDSE --> READ --> DET --> SIZE --> HUNG
+    AIS --> DR --> HUNG --> UI
+```
 
-| Dataset | Sensor | Notes |
-|---|---|---|
-| **xView3-SAR** | Sentinel-1 GRD | Largest; includes dark-vessel labels — closest to this task |
-| **HRSID** | S1 + TerraSAR-X | High-res, OBB-friendly |
-| **SSDD / LS-SSDD** | Sentinel-1 | Classic benchmark; LS variant is full-scene |
+Key mechanics worth knowing:
 
-Recommended recipe (see `backend/detection/yolo_sar.py` docstring for the
-exact commands): start from `yolov8m-obb.pt`, convert SAR dB chips to 8-bit
-with a 2–98 percentile stretch, tile scenes to 1024×1024 with 128 px overlap,
-train ~100 epochs, then calibrate the confidence threshold against a held-out
-scene so precision ≥ 0.9 before enabling auto-flagging.
+- **Frame mosaicking**: one overpass arrives as several rotated frame
+  files; they're grouped (≤120 s apart) and mosaicked so your AOI isn't a
+  sliver. The per-pass "% imaged" indicator tells you when the swath
+  genuinely missed part of your box.
+- **Time alignment is guaranteed by construction**: AIS is fetched
+  ±window around *each pass's own* acquisition time, and every snapshot
+  carries a `time_alignment` block the UI turns into plain-language
+  diagnoses ("this pass predates your AIS recording" vs "receiver gap").
+- **Detections are cached per (scene, detector, AOI)**: re-running a pass
+  is free — only fusion re-runs against the ever-growing AIS store.
+- **Pseudo-calibration**: CDSE GRD DNs are uncalibrated; chips are
+  anchored by their 30th-percentile backscatter to typical calm-sea σ0.
+  Within a couple of dB of true calibration, which is enough for the
+  model's 15 dB input window — but see limitations.
+
+## Repository layout
+
+```
+app/streamlit_app.py        dashboard (map, corrections, config panel)
+backend/pipeline.py         per-pass orchestration + caching
+backend/ingestion/          STAC/COG reader · AIS providers · AIS collector
+backend/detection/          detector backends behind one interface
+backend/fusion/matcher.py   dead reckoning + Hungarian assignment
+backend/measurement.py      native-res ship size estimation
+backend/diagnostics.py      data-source health checks
+replicate_xview3/           Cog package for the detection model
+db/schema.sql               optional PostGIS persistence schema
+```
+
+## Deploying behind a reverse proxy
+
+Set `SAT_TRACKER_BIND=127.0.0.1:8501` (or join the container to your
+proxy's docker network) so the dashboard isn't reachable except through
+your auth layer — the UI can trigger billable API calls, so don't leave
+it open. Streamlit needs websocket pass-through (`Upgrade`/`Connection`
+headers). The AIS collector must run 24/7 to be useful: it can only
+record traffic while it's running, and history can't be backfilled from
+the free feed.
+
+## Limitations — read before trusting results
+
+- **This is a research/OSINT tool, not evidence.** A "dark vessel" flag
+  means: radar target, no matching AIS within the gate/window. Causes
+  include AIS receiver gaps (common on the free terrestrial feed), small
+  craft with no AIS carriage requirement, and detector false positives.
+- Radiometric calibration is approximated (percentile anchoring), and
+  georeferencing uses GCP warping without terrain correction — fine over
+  open water, degraded near steep coastlines.
+- Size estimates are ±10–25 m at Sentinel-1 resolution; anchored clusters
+  can merge; bow/stern is ambiguous in the axis estimate.
+- Free AIS history starts when *your* collector starts. For retroactive
+  or dependable coverage, use a commercial AIS provider via the `rest`
+  backend, or public historical archives (US: NOAA MarineCadastre).
+- Not for navigation or safety-of-life use.
+
+## Training your own detector (optional)
+
+Public SAR ship datasets: [xView3-SAR](https://iuu.xview.us/) (closest to
+this task — includes dark-vessel labels), HRSID, SSDD/LS-SSDD. For a local
+YOLOv8-OBB: 1024 px tiles with overlap, dB chips with 2–98 percentile
+stretch to uint8, `yolo obb train model=yolov8m-obb.pt imgsz=1024
+degrees=180 mosaic=0.5`, then point the `yolo` backend at the weights.
+
+## License & attribution
+
+- Code: [MIT](LICENSE).
+- `replicate_xview3/unet.py` is vendored from
+  [selimsef/xview3_solution](https://github.com/selimsef/xview3_solution)
+  (xView3 2nd place) under
+  [Apache-2.0](replicate_xview3/LICENSE) — thank you, Selim Seferbekov.
+- Imagery: *contains modified Copernicus Sentinel data*, courtesy of the
+  [Copernicus Data Space Ecosystem](https://dataspace.copernicus.eu/).
+- AIS: [aisstream.io](https://aisstream.io) community feed.
+- The xView3 challenge by the [Defense Innovation Unit](https://iuu.xview.us/)
+  created the dataset and task this project's detector descends from.

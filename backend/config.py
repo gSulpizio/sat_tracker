@@ -68,9 +68,12 @@ class Settings:
     ais_store_dir: Path = AIS_STORE_DIR
 
     # Replicate-hosted detector (xView3 2nd-place model packaged in
-    # replicate_xview3/) — pay-per-second, scale-to-zero
+    # replicate_xview3/) — pay-per-second, scale-to-zero. The default is
+    # the published public deployment of that package; bring your own
+    # Replicate API token and it works with no model setup at all.
     replicate_api_token: str = os.getenv("REPLICATE_API_TOKEN", "")
-    replicate_model: str = os.getenv("REPLICATE_MODEL", "")
+    replicate_model: str = os.getenv("REPLICATE_MODEL",
+                                     "gsulpizio/xview3-vessel-detect")
 
     # Detection backend: "replicate" | "yolo" | "roboflow" | "vertex"
     # ("mock": simulate only)

@@ -477,9 +477,13 @@ def config_panel() -> None:
             )
             repl_model = st.text_input(
                 "Replicate model (owner/name)", saved.replicate_model,
-                help="The model pushed from this repo's replicate_xview3/ "
-                     "package, in 'owner/name' form exactly as shown on its "
-                     "Replicate page (e.g. 'youruser/xview3-vessel-detect'). "
+                help="Which Replicate deployment to call, in 'owner/name' "
+                     "form. The default 'gsulpizio/xview3-vessel-detect' is "
+                     "the published public build of this repo's "
+                     "replicate_xview3/ package — works with any Replicate "
+                     "token, no model setup needed (you pay your own usage). "
+                     "To self-host instead, push the package to your account "
+                     "with cog (see README) and put your owner/name here. "
                      "Only used when the detector backend is 'replicate'.",
             )
 
