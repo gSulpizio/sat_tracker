@@ -205,12 +205,14 @@ Config (`data/user_config.json`, credentials, `data/locations.json`,
 the AIS store, cached snapshots) lives on a bind-mounted volume — set
 `SAT_TRACKER_DATA_DIR` or edit the `volumes:` path in `docker-compose.yml`
 to point at wherever that should persist on the host. The collector reads
-its watch area and API key from env vars (`AOI_BBOX`, `AIS_API_KEY`) via
-an `.env` file next to the data directory, since it has no
-`user_config.json` of its own to read the dashboard's active location
-from — if you actively monitor more than one location, duplicate the
-`sat-tracker-collector` service block with a different `AOI_BBOX` per
-area so AIS keeps recording for all of them.
+its API key from env (`AIS_API_KEY`) via an `.env` file next to the data
+directory. By default it watches **every area saved under 📍 Saved
+locations** — aisstream accepts multiple bounding boxes in one
+subscription, so one process/websocket covers all of them at once rather
+than needing a container per location. The list is re-read every 15
+minutes (forcing a reconnect), so adding or removing a location in the
+app takes effect without restarting the collector. Pass `AOI_BBOX` (or
+`--bbox` on the CLI) to pin it to one explicit area instead.
 
 ## Model Training Notes (YOLOv8-OBB for SAR)
 
