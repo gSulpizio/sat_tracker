@@ -18,7 +18,11 @@ class Detection:
     # Oriented bounding box corners as [(lon, lat), ...] — optional; point
     # detectors (or CFAR prescreeners) may only produce a centroid.
     obb_lonlat: list[tuple[float, float]] = field(default_factory=list)
+    # Physical size, filled by backend.measurement from a native-resolution
+    # chip after detection (detector-agnostic) — or by an OBB detector.
     length_m: float | None = None
+    width_m: float | None = None
+    heading_deg: float | None = None   # 0–180°, N=0/E=90; bow/stern ambiguous
     source_model: str = "unknown"
 
     def to_dict(self) -> dict:
@@ -29,6 +33,8 @@ class Detection:
             "confidence": round(self.confidence, 3),
             "obb": [[round(x, 6), round(y, 6)] for x, y in self.obb_lonlat],
             "length_m": self.length_m,
+            "width_m": self.width_m,
+            "heading_deg": self.heading_deg,
             "source_model": self.source_model,
         }
 

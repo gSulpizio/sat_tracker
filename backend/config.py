@@ -78,6 +78,11 @@ class Settings:
     include_s2: bool = os.getenv("INCLUDE_S2", "1") == "1"
     s2_max_cloud: float = float(os.getenv("S2_MAX_CLOUD", "40"))
 
+    # Measure each detection's physical size (length/beam/heading) from a
+    # native-resolution chip after detection — a handful of small extra S3
+    # window reads per pass, no API cost.
+    measure_lengths: bool = os.getenv("MEASURE_LENGTHS", "1") == "1"
+
     # Fusion parameters
     temporal_window_s: int = int(os.getenv("FUSION_TEMPORAL_WINDOW_S", "300"))  # ±5 min
     match_gate_m: float = float(os.getenv("FUSION_MATCH_GATE_M", "1000"))       # 1 km
@@ -120,7 +125,7 @@ _PERSISTED_FIELDS = (
     "roboflow_api_key", "roboflow_model_id",
     "temporal_window_s", "match_gate_m",
     "search_days", "max_scenes", "aoi_bbox",
-    "include_s2", "s2_max_cloud",
+    "include_s2", "s2_max_cloud", "measure_lengths",
 )
 
 

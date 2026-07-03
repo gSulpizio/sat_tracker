@@ -316,6 +316,18 @@ def config_panel() -> None:
                      "picking the optical context image. Lower = clearer "
                      "image but more passes end up with no optical layer.",
             )
+            measure_lengths = st.toggle(
+                "Measure ship sizes", value=saved.measure_lengths,
+                help="After detection, re-read a small NATIVE-resolution "
+                     "(~10 m/px) chip around each ship and estimate its "
+                     "length, beam, and axis orientation from the radar "
+                     "signature — shown in the marker popup as e.g. "
+                     "'Size: ~180 × 30 m'. Costs a few extra tiny S3 reads "
+                     "per pass, no API credits. Accuracy ≈ ±10–25 m and "
+                     "faint hull ends get clipped, so treat as an estimate; "
+                     "large ships' sidelobes are suppressed but anchored "
+                     "clusters can still merge into one oversized blob.",
+            )
 
             st.markdown("**Scene search**")
             search_days = st.number_input(
@@ -491,6 +503,7 @@ def config_panel() -> None:
             match_gate_m=float(gate_m),
             include_s2=bool(include_s2),
             s2_max_cloud=float(s2_max_cloud),
+            measure_lengths=bool(measure_lengths),
             aoi_bbox=(min_lon, min_lat, max_lon, max_lat),
             search_days=int(search_days),
             max_scenes=int(max_scenes),
@@ -819,12 +832,19 @@ def build_map(snap: dict, vessels: dict, show_sar: bool, show_s2: bool,
     for v in vessels.values():
         style = STATUS_STYLE[v["status"]]
         det = v.get("detection") or {}
+        size_line = ""
+        if det.get("length_m"):
+            size_line = (f"<br>Size: ~{det['length_m']:.0f} × "
+                         f"{det.get('width_m') or 0:.0f} m")
+            if det.get("heading_deg") is not None:
+                size_line += f" · axis {det['heading_deg']:.0f}°/{(det['heading_deg'] + 180) % 360:.0f}°"
         popup_html = (
             f"<b>{v['id']}</b> — {style['label']}<br>"
             f"MMSI: {v.get('mmsi') or '—'}<br>"
             f"Position: {v['lat']:.5f}, {v['lon']:.5f}<br>"
             f"Match dist: {v.get('match_dist_m') or '—'} m<br>"
             f"Model conf: {det.get('confidence', '—')}"
+            + size_line
             + ("<br><i>manually added</i>" if v.get("manual") else "")
         )
         folium.CircleMarker(

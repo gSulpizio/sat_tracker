@@ -239,6 +239,13 @@ def run(
                 detections = detector.detect(scene)
                 log.info("Detector (%s): %d ship candidates",
                          cfg.detector_backend, len(detections))
+                if not simulated and cfg.measure_lengths and detections:
+                    from backend.measurement import measure_detections
+
+                    n_sized = measure_detections(
+                        [r.asset_href for r in group], detections, cfg=cfg)
+                    log.info("Sized %d/%d detections from native-res chips",
+                             n_sized, len(detections))
                 _render_sar_overlay(scene, cfg.snapshots_dir / overlay_name)
                 # Fraction of the AOI actually imaged by this pass. A
                 # rotated frame footprint (or a seam between adjacent
@@ -377,6 +384,8 @@ def _load_cached(snap_file, overlay_name: str, cfg: Settings):
             confidence=d.get("confidence") or 0.0,
             obb_lonlat=[tuple(p) for p in d.get("obb") or []],
             length_m=d.get("length_m"),
+            width_m=d.get("width_m"),
+            heading_deg=d.get("heading_deg"),
             source_model=d.get("source_model", "cached"),
         )
         for v in old.get("vessels", [])
