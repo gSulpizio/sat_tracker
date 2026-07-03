@@ -1,0 +1,57 @@
+# Deployment compose file for the NAS. This repo is cloned to
+# /home/gsulpizio/sat-tracker on the NAS, and media-stack's top-level
+# docker-compose.yml includes THIS file directly from that path — so
+# `build: context:` below is an absolute NAS path, not `.` (this file
+# does not live inside the media-stack repo). Services here join
+# media-stack's default docker network automatically via `include:`, so
+# nginx-proxy-manager reaches the dashboard by container name; no host
+# port needs to be published.
+#
+# Resource philosophy: the only process that does heavy work (imagery
+# download, detector API calls) is triggered on-demand from the UI's
+# ▶ Run pipeline button — nothing here runs it on a schedule. Both
+# services get hard memory/CPU ceilings so even a heavy manual run, or a
+# runaway process, can't starve the rest of the NAS.
+services:
+  sat-tracker:
+    build:
+      context: /home/gsulpizio/sat-tracker
+      dockerfile: Dockerfile
+    container_name: sat-tracker
+    command: >
+      streamlit run app/streamlit_app.py
+      --server.address=0.0.0.0 --server.port=8501
+      --server.headless=true --browser.gatherUsageStats=false
+    volumes:
+      - /srv/media/config/sat-tracker/data:/app/data
+    env_file:
+      - path: /srv/media/config/sat-tracker/.env
+        required: false
+    restart: unless-stopped
+    mem_limit: 768m
+    cpus: 1.5
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Records live AIS traffic for the AOI continuously — this is the one
+  # piece that genuinely needs to run 24/7 (fusion needs a ping history
+  # to match against), but it's just an idle websocket listener the rest
+  # of the time, hence the small resource ceiling.
+  sat-tracker-collector:
+    build:
+      context: /home/gsulpizio/sat-tracker
+      dockerfile: Dockerfile
+    container_name: sat-tracker-collector
+    command: python -m backend.ingestion.ais_collector
+    volumes:
+      - /srv/media/config/sat-tracker/data:/app/data
+    env_file:
+      - path: /srv/media/config/sat-tracker/.env
+        required: false
+    restart: unless-stopped
+    mem_limit: 192m
+    cpus: 0.25

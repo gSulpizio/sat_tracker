@@ -1,0 +1,26 @@
+# Core pipeline
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11          # linear_sum_assignment (Hungarian)
+pyproj>=3.6          # geodesic dead reckoning / distances
+shapely>=2.0
+rasterio>=1.3        # COG windowed reads
+pystac-client>=0.7   # STAC search against Copernicus Data Space
+requests>=2.31
+pillow>=10.0
+
+# Frontend
+streamlit>=1.35
+folium>=0.16
+streamlit-folium>=0.20
+
+# Optional — live AIS collector daemon (aisstream.io → local store)
+# websockets>=12.0
+
+# Optional — local open-source detector (GPU recommended)
+# ultralytics>=8.2
+
+# Optional — database persistence
+# psycopg[binary]>=3.1
+# sqlalchemy>=2.0
+# geoalchemy2>=0.14
