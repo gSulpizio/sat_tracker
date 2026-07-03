@@ -99,8 +99,26 @@ def edits_for(snap: dict) -> dict:
             "vessels": {v["id"]: dict(v) for v in snap["vessels"]},
             "corrections": [],
             "last_click": None,
+            "last_marker_click": None,
         }
     return st.session_state.edits[scene_id]
+
+
+def delete_vessel(vessels: dict, edits: dict, vessel_id: str) -> None:
+    """Remove a detection the model got wrong. A VERIFIED target keeps its
+    AIS track as a green 'AIS only' marker — deleting the radar detection
+    shouldn't also erase a real ship's broadcast history."""
+    removed = vessels.pop(vessel_id)
+    if removed["status"] == "VERIFIED" and removed.get("mmsi"):
+        vessels[vessel_id + "_ais"] = {
+            "id": vessel_id + "_ais",
+            "status": "AIS_ONLY",
+            "lat": removed["lat"],
+            "lon": removed["lon"],
+            "mmsi": removed["mmsi"],
+            "match_dist_m": None,
+        }
+    log_correction(edits, "DELETE", vessel_id=vessel_id)
 
 
 def is_simulated(snap: dict) -> bool:
@@ -1044,10 +1062,13 @@ with st.sidebar:
         "Map click mode",
         ["Inspect", "Add missed vessel (false negative)"],
         help="**Inspect** — clicking the map only opens marker popups.\n\n"
-             "**Add missed vessel** — each map click drops a new DARK contact "
-             "at that position. Use when you can see a ship in the SAR layer "
-             "that the model failed to detect. Added contacts are recorded in "
-             "the correction audit trail.",
+             "**Add missed vessel** — each click on empty water drops a new "
+             "DARK contact there. Use when you can see a ship in the SAR "
+             "layer that the model failed to detect. Added contacts are "
+             "recorded in the correction audit trail.\n\n"
+             "In either mode, clicking directly ON a marker selects it and "
+             "shows a 🗑 Delete button below the map — use that for false "
+             "positives (islands, rigs, buoys, wave clutter).",
     )
 
     st.subheader("🗑 Delete false positive")
@@ -1062,17 +1083,7 @@ with st.sidebar:
              "lost. Deletions are recorded in the audit trail.",
     )
     if st.button("Delete / ignore", disabled=del_choice is None, use_container_width=True):
-        removed = vessels.pop(del_choice)
-        if removed["status"] == "VERIFIED" and removed.get("mmsi"):
-            vessels[del_choice + "_ais"] = {
-                "id": del_choice + "_ais",
-                "status": "AIS_ONLY",
-                "lat": removed["lat"],
-                "lon": removed["lon"],
-                "mmsi": removed["mmsi"],
-                "match_dist_m": None,
-            }
-        log_correction(edits, "DELETE", vessel_id=del_choice)
+        delete_vessel(vessels, edits, del_choice)
         st.rerun()
 
     st.subheader("🔗 Re-link dark vessel → AIS track")
@@ -1188,8 +1199,11 @@ map_state = st_folium(
     # pan/zoom/bounds change too, which triggers a full Streamlit rerun (and
     # a full re-embed of the SAR/S2 overlay images) on every drag — that
     # round-trip is what makes panning feel frozen. Panning/zooming now stay
-    # entirely client-side in Leaflet.
-    returned_objects=["last_clicked"],
+    # entirely client-side in Leaflet. last_object_clicked_tooltip carries
+    # the tooltip text of whichever marker was clicked (markers are
+    # tooltipped with "id · status · mmsi") — that's how we know WHICH
+    # vessel a click was on, for the click-to-delete flow below.
+    returned_objects=["last_clicked", "last_object_clicked_tooltip"],
 )
 
 # Click-to-add: act once per distinct click coordinate
@@ -1208,6 +1222,36 @@ if clicked and mode_click.startswith("Add") and clicked != edits["last_click"]:
     }
     log_correction(edits, "ADD", vessel_id=new_id, lat=clicked["lat"], lon=clicked["lng"])
     st.rerun()
+
+# Click-to-delete: clicking a marker surfaces a confirm button right here,
+# instead of having to find it in the sidebar dropdown.
+marker_tooltip = map_state.get("last_object_clicked_tooltip") if map_state else None
+if marker_tooltip and marker_tooltip != edits["last_marker_click"]:
+    edits["last_marker_click"] = marker_tooltip
+    st.session_state["_selected_marker_id"] = marker_tooltip.split(" · ")[0].strip()
+
+selected_id = st.session_state.get("_selected_marker_id")
+if selected_id and selected_id in vessels:
+    sv = vessels[selected_id]
+    style = STATUS_STYLE[sv["status"]]
+    sc1, sc2, sc3 = st.columns([3, 1, 1])
+    sc1.markdown(f"**Selected:** {vessel_label(sv)} — {style['label']}")
+    if sc2.button(
+        "🗑 Delete this detection", key="delete_selected_marker",
+        use_container_width=True,
+        help="Remove this marker — same as the sidebar 🗑 Delete false "
+             "positive tool. A VERIFIED target's AIS track is kept as a "
+             "green 'AIS only' marker, not deleted along with it.",
+    ):
+        delete_vessel(vessels, edits, selected_id)
+        st.session_state["_selected_marker_id"] = None
+        st.rerun()
+    if sc3.button("Deselect", key="deselect_marker", use_container_width=True,
+                 help="Clear the selection without deleting anything."):
+        st.session_state["_selected_marker_id"] = None
+        st.rerun()
+elif selected_id:
+    st.session_state["_selected_marker_id"] = None  # stale (already deleted etc.)
 
 if edits["corrections"]:
     with st.expander(f"Correction audit trail ({len(edits['corrections'])})"):
