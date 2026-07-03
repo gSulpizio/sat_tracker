@@ -121,6 +121,17 @@ def delete_vessel(vessels: dict, edits: dict, vessel_id: str) -> None:
     log_correction(edits, "DELETE", vessel_id=vessel_id)
 
 
+def relink_vessel(vessels: dict, edits: dict, dark_id: str, ais_id: str) -> None:
+    """Merge a DARK detection with an AIS-only track the matcher missed —
+    the dark vessel becomes VERIFIED, carrying the track's MMSI."""
+    dark_v = vessels[dark_id]
+    ais_v = vessels.pop(ais_id)
+    dark_v["status"] = "VERIFIED"
+    dark_v["mmsi"] = ais_v["mmsi"]
+    dark_v["manual_link"] = True
+    log_correction(edits, "RELINK", vessel_id=dark_id, mmsi=ais_v["mmsi"])
+
+
 def is_simulated(snap: dict) -> bool:
     return bool(snap.get("simulated")) or "SIM" in snap["scene"]["scene_id"]
 
@@ -1066,53 +1077,12 @@ with st.sidebar:
              "DARK contact there. Use when you can see a ship in the SAR "
              "layer that the model failed to detect. Added contacts are "
              "recorded in the correction audit trail.\n\n"
-             "In either mode, clicking directly ON a marker selects it and "
-             "shows a 🗑 Delete button below the map — use that for false "
-             "positives (islands, rigs, buoys, wave clutter).",
+             "In either mode, clicking directly ON a marker selects it: a "
+             "DARK or VERIFIED target shows a 🗑 Delete button; a DARK "
+             "target also offers 🔗 Link to AIS track, which then asks you "
+             "to click the matching green (AIS-only) marker to complete "
+             "the link.",
     )
-
-    st.subheader("🗑 Delete false positive")
-    deletable = [v for v in vessels.values() if v["status"] in ("DARK", "VERIFIED")]
-    del_choice = st.selectbox(
-        "Detection to remove",
-        options=[None] + [v["id"] for v in deletable],
-        format_func=lambda i: "—" if i is None else vessel_label(vessels[i]),
-        help="Remove a detection the model got wrong — an island, oil rig, "
-             "buoy, or wave clutter. Deleting a VERIFIED target keeps its AIS "
-             "track as a green 'AIS only' marker, so no broadcast data is "
-             "lost. Deletions are recorded in the audit trail.",
-    )
-    if st.button("Delete / ignore", disabled=del_choice is None, use_container_width=True):
-        delete_vessel(vessels, edits, del_choice)
-        st.rerun()
-
-    st.subheader("🔗 Re-link dark vessel → AIS track")
-    dark_ids = [v["id"] for v in vessels.values() if v["status"] == "DARK"]
-    ais_ids = [v["id"] for v in vessels.values() if v["status"] == "AIS_ONLY"]
-    link_dark = st.selectbox(
-        "Dark vessel", [None] + dark_ids,
-        format_func=lambda i: "—" if i is None else vessel_label(vessels[i]),
-        help="A radar detection the matcher left without an AIS identity — "
-             "e.g. because the ship was just outside the distance gate or its "
-             "ping fell outside the time window.",
-    )
-    link_ais = st.selectbox(
-        "Unmatched AIS track", [None] + ais_ids,
-        format_func=lambda i: "—" if i is None else vessel_label(vessels[i]),
-        help="A broadcasting ship the matcher couldn't pair with any "
-             "detection. Linking it to the dark vessel above merges the two "
-             "into one VERIFIED target carrying the track's MMSI.",
-    )
-    if st.button(
-        "Link as verified", disabled=not (link_dark and link_ais), use_container_width=True
-    ):
-        dark_v = vessels[link_dark]
-        ais_v = vessels.pop(link_ais)
-        dark_v["status"] = "VERIFIED"
-        dark_v["mmsi"] = ais_v["mmsi"]
-        dark_v["manual_link"] = True
-        log_correction(edits, "RELINK", vessel_id=link_dark, mmsi=ais_v["mmsi"])
-        st.rerun()
 
     st.divider()
     st.download_button(
@@ -1223,35 +1193,85 @@ if clicked and mode_click.startswith("Add") and clicked != edits["last_click"]:
     log_correction(edits, "ADD", vessel_id=new_id, lat=clicked["lat"], lon=clicked["lng"])
     st.rerun()
 
-# Click-to-delete: clicking a marker surfaces a confirm button right here,
-# instead of having to find it in the sidebar dropdown.
+# Click-to-select: clicking a marker surfaces delete/link actions right
+# here, instead of hunting through sidebar dropdowns.
 marker_tooltip = map_state.get("last_object_clicked_tooltip") if map_state else None
 if marker_tooltip and marker_tooltip != edits["last_marker_click"]:
     edits["last_marker_click"] = marker_tooltip
     st.session_state["_selected_marker_id"] = marker_tooltip.split(" · ")[0].strip()
 
+# Stale IDs (already deleted, or left over from a different pass) never
+# resolve to a real vessel — just drop them rather than erroring.
 selected_id = st.session_state.get("_selected_marker_id")
-if selected_id and selected_id in vessels:
+if selected_id and selected_id not in vessels:
+    st.session_state["_selected_marker_id"] = None
+    selected_id = None
+link_source_id = st.session_state.get("_link_source_id")
+if link_source_id and link_source_id not in vessels:
+    st.session_state["_link_source_id"] = None
+    link_source_id = None
+
+if link_source_id:
+    src = vessels[link_source_id]
+    lc1, lc2 = st.columns([4, 1])
+    lc1.info(f"🔗 Linking **{vessel_label(src)}** — click a green "
+             "AIS-only marker on the map to complete the link.")
+    if lc2.button("Cancel linking", key="cancel_linking", use_container_width=True):
+        st.session_state["_link_source_id"] = None
+        st.session_state["_selected_marker_id"] = None
+        st.rerun()
+    elif selected_id and selected_id != link_source_id:
+        target = vessels[selected_id]
+        if target["status"] == "AIS_ONLY":
+            if st.button(
+                f"✔ Confirm: link {vessel_label(src)} ↔ {vessel_label(target)}",
+                key="confirm_link", use_container_width=True,
+                help="Merges these into one VERIFIED target carrying the "
+                     "AIS track's MMSI. Recorded in the audit trail.",
+            ):
+                relink_vessel(vessels, edits, link_source_id, selected_id)
+                st.session_state["_link_source_id"] = None
+                st.session_state["_selected_marker_id"] = None
+                st.rerun()
+        else:
+            st.warning(f"{vessel_label(target)} isn't an AIS-only (green) "
+                       "track — click a green marker to complete the link.")
+elif selected_id:
     sv = vessels[selected_id]
     style = STATUS_STYLE[sv["status"]]
-    sc1, sc2, sc3 = st.columns([3, 1, 1])
-    sc1.markdown(f"**Selected:** {vessel_label(sv)} — {style['label']}")
-    if sc2.button(
-        "🗑 Delete this detection", key="delete_selected_marker",
-        use_container_width=True,
-        help="Remove this marker — same as the sidebar 🗑 Delete false "
-             "positive tool. A VERIFIED target's AIS track is kept as a "
-             "green 'AIS only' marker, not deleted along with it.",
-    ):
-        delete_vessel(vessels, edits, selected_id)
+    can_delete = sv["status"] in ("DARK", "VERIFIED")
+    can_link = sv["status"] == "DARK" and any(
+        v["status"] == "AIS_ONLY" for v in vessels.values()
+    )
+    cols = st.columns([3] + [1] * (1 + can_delete + can_link))
+    cols[0].markdown(f"**Selected:** {vessel_label(sv)} — {style['label']}")
+    ci = 1
+    if can_delete:
+        if cols[ci].button(
+            "🗑 Delete", key="delete_selected_marker", use_container_width=True,
+            help="Remove this detection. A VERIFIED target's AIS track is "
+                 "kept as a green 'AIS only' marker, not deleted along with it.",
+        ):
+            delete_vessel(vessels, edits, selected_id)
+            st.session_state["_selected_marker_id"] = None
+            st.rerun()
+        ci += 1
+    if can_link:
+        if cols[ci].button(
+            "🔗 Link to AIS track", key="start_link", use_container_width=True,
+            help="This radar detection has no AIS match yet. Click this, "
+                 "then click the green (AIS-only) marker it should be "
+                 "paired with — e.g. a ship the matcher missed because it "
+                 "was just outside the distance gate or time window.",
+        ):
+            st.session_state["_link_source_id"] = selected_id
+            st.session_state["_selected_marker_id"] = None
+            st.rerun()
+        ci += 1
+    if cols[ci].button("Deselect", key="deselect_marker", use_container_width=True,
+                       help="Clear the selection without changing anything."):
         st.session_state["_selected_marker_id"] = None
         st.rerun()
-    if sc3.button("Deselect", key="deselect_marker", use_container_width=True,
-                 help="Clear the selection without deleting anything."):
-        st.session_state["_selected_marker_id"] = None
-        st.rerun()
-elif selected_id:
-    st.session_state["_selected_marker_id"] = None  # stale (already deleted etc.)
 
 if edits["corrections"]:
     with st.expander(f"Correction audit trail ({len(edits['corrections'])})"):
