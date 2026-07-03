@@ -63,6 +63,31 @@ class ReplicateDetector(VesselDetector):
                 "Replicate model not set — use 'owner/name' as shown on "
                 "the model's Replicate page."
             )
+        self._version: str | None = None  # resolved lazily, cached
+
+    def _latest_version(self) -> str:
+        """Private/community models can't use the model-scoped predictions
+        endpoint (that's official-models only — it 404s otherwise); we must
+        create predictions against an explicit version id instead."""
+        if self._version:
+            return self._version
+        import requests
+
+        r = requests.get(f"{API_ROOT}/models/{self.model}",
+                         headers={"Authorization": f"Bearer {self.api_token}"},
+                         timeout=30)
+        if r.status_code == 404:
+            raise ValueError(
+                f"Replicate model '{self.model}' not found — check "
+                "owner/name and that your token belongs to that account.")
+        r.raise_for_status()
+        version = (r.json().get("latest_version") or {}).get("id")
+        if not version:
+            raise ValueError(
+                f"Replicate model '{self.model}' has no pushed version yet "
+                "— run `cog push` first (see replicate_xview3/).")
+        self._version = version
+        return version
 
     # ------------------------------------------------------------- chips
     def _collect_chips(self, scene: Scene) -> list[dict]:
@@ -158,16 +183,13 @@ class ReplicateDetector(VesselDetector):
 
         file_url = self._upload_npz(vv_db, vh_db)
         resp = requests.post(
-            f"{API_ROOT}/models/{self.model}/predictions",
+            f"{API_ROOT}/predictions",
             headers={"Authorization": f"Bearer {self.api_token}",
                      "Prefer": "wait=60"},
-            json={"input": {"chip": file_url, "confidence": CONFIDENCE}},
+            json={"version": self._latest_version(),
+                  "input": {"chip": file_url, "confidence": CONFIDENCE}},
             timeout=90,
         )
-        if resp.status_code == 404:
-            raise ValueError(
-                f"Replicate model '{self.model}' not found — check "
-                "owner/name and that your token belongs to that account.")
         if resp.status_code == 402:
             raise ValueError(
                 "Replicate returned 402 Payment Required — add billing at "
