@@ -182,6 +182,36 @@ python -m backend.pipeline --mode simulate                  # mock detector
 python -m backend.pipeline --mode simulate --ais old.csv    # scene time auto-aligns to the file
 ```
 
+## Docker Deployment
+
+Two long-running services (`docker-compose.yml`), built from one shared image:
+
+- **`sat-tracker`** — the Streamlit dashboard. A plain idle web server; the
+  only heavy work (imagery download, detector API calls) runs on-demand
+  when an analyst clicks ▶ Run pipeline, never on a schedule.
+- **`sat-tracker-collector`** — the AIS websocket listener
+  (`backend/ingestion/ais_collector.py`). Needs to run continuously since
+  fusion depends on a ping history, but it's idle almost all the time
+  (waiting on the socket) — negligible CPU, tens of MB of RAM.
+
+Both carry hard `mem_limit`/`cpus` ceilings so neither a heavy manual
+pipeline run nor a runaway process can starve the host.
+
+```bash
+docker compose up -d --build
+```
+
+Config (`data/user_config.json`, credentials, `data/locations.json`,
+the AIS store, cached snapshots) lives on a bind-mounted volume — set
+`SAT_TRACKER_DATA_DIR` or edit the `volumes:` path in `docker-compose.yml`
+to point at wherever that should persist on the host. The collector reads
+its watch area and API key from env vars (`AOI_BBOX`, `AIS_API_KEY`) via
+an `.env` file next to the data directory, since it has no
+`user_config.json` of its own to read the dashboard's active location
+from — if you actively monitor more than one location, duplicate the
+`sat-tracker-collector` service block with a different `AOI_BBOX` per
+area so AIS keeps recording for all of them.
+
 ## Model Training Notes (YOLOv8-OBB for SAR)
 
 Public SAR ship datasets suitable for fine-tuning:
