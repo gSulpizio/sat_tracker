@@ -39,15 +39,10 @@ CHIP = 800            # matches the shard size the model was trained on
 STRIDE = 704          # 96 px overlap so ships on seams aren't cut
 CONFIDENCE = 100.0    # center-head threshold the original solution used
 DEDUPE_M = 120.0      # cross-chip/frame duplicate radius, metres
-# Percentile-anchored pseudo-calibration: CDSE GRD DNs are uncalibrated;
-# the model wants sigma0 dB. Anchoring each chip's 30th-percentile
-# backscatter (sea is the darkest extended surface, so p30 ≈ sea even when
-# up to ~2/3 of the chip is land/harbor — a plain median broke exactly
-# there in testing) to typical calm-sea sigma0 gets within a couple of dB
-# of real calibration, enough for the model's 15 dB normalization window.
-SEA_PCTL = 30
-SEA_VV_DB = -20.5
-SEA_VH_DB = -28.0
+# All radiometric preprocessing (amplitude→dB, sea-percentile pseudo-
+# calibration, normalization) lives INSIDE the Replicate predictor now —
+# the client just ships raw-amplitude 2-band float32 TIFF chips, the same
+# format any other user of the public model would send.
 
 
 class ReplicateDetector(VesselDetector):
@@ -151,17 +146,17 @@ class ReplicateDetector(VesselDetector):
         return chips
 
     # --------------------------------------------------------------- API
-    def _upload_npz(self, vv_db: np.ndarray, vh_db: np.ndarray) -> str:
+    def _upload_tiff(self, vv: np.ndarray, vh: np.ndarray) -> str:
         import requests
+        import tifffile
 
         buf = io.BytesIO()
-        np.savez_compressed(buf, vv_db=vv_db.astype("float32"),
-                            vh_db=vh_db.astype("float32"))
+        tifffile.imwrite(buf, np.stack([vv, vh]).astype("float32"))
         buf.seek(0)
         resp = requests.post(
             f"{API_ROOT}/files",
             headers={"Authorization": f"Bearer {self.api_token}"},
-            files={"content": ("chip.npz", buf, "application/octet-stream")},
+            files={"content": ("chip.tif", buf, "image/tiff")},
             timeout=120,
         )
         resp.raise_for_status()
@@ -170,24 +165,25 @@ class ReplicateDetector(VesselDetector):
     def _predict_chip(self, chip: dict) -> list[Detection]:
         import requests
 
-        vv, vh = chip["vv"], chip["vh"]
-        vv_db = 20.0 * np.log10(np.maximum(vv, 1.0))
-        vh_db = 20.0 * np.log10(np.maximum(vh, 1.0))
-        valid = vv > 0
-        vv_db = vv_db - (np.percentile(vv_db[valid], SEA_PCTL) - SEA_VV_DB)
-        vh_valid = vh > 0
-        if vh_valid.any():
-            vh_db = vh_db - (np.percentile(vh_db[vh_valid], SEA_PCTL) - SEA_VH_DB)
-        vv_db[~valid] = -100.0
-        vh_db[~vh_valid] = -100.0
+        # Raw amplitude straight from the COGs — the predictor owns
+        # amplitude→dB conversion and sea-anchored pseudo-calibration.
+        file_url = self._upload_tiff(chip["vv"], chip["vh"])
 
-        file_url = self._upload_npz(vv_db, vh_db)
+        # Exact ground sampling of this (warped) chip, so the model's
+        # length regression is scaled correctly.
+        tfm = chip["transform"]
+        _, center_lat = tfm * (chip["vv"].shape[1] / 2, chip["vv"].shape[0] / 2)
+        mpp_x = abs(tfm.a) * 111_320.0 * math.cos(math.radians(center_lat))
+        mpp_y = abs(tfm.e) * 110_540.0
+        pixel_spacing = round((mpp_x + mpp_y) / 2, 2)
+
         resp = requests.post(
             f"{API_ROOT}/predictions",
             headers={"Authorization": f"Bearer {self.api_token}",
                      "Prefer": "wait=60"},
             json={"version": self._latest_version(),
-                  "input": {"chip": file_url, "confidence": CONFIDENCE}},
+                  "input": {"image": file_url, "confidence": CONFIDENCE,
+                            "pixel_spacing_m": pixel_spacing}},
             timeout=90,
         )
         if resp.status_code == 402:
@@ -215,10 +211,17 @@ class ReplicateDetector(VesselDetector):
                 f"{pred.get('error') or pred.get('status')}")
 
         out = []
-        tfm = chip["transform"]
+        vv = chip["vv"]
+        h_chip, w_chip = vv.shape
         for d in (pred.get("output") or {}).get("detections", []):
             if not d.get("is_vessel", True):
                 continue  # fixed structure (platform/rig), not a ship
+            # Belt-and-braces against swath-edge phantoms: a ship can't be
+            # where the radar recorded nothing. (The predictor filters
+            # these too, but the client has the raw chip right here.)
+            cy, cx = int(round(d["y"])), int(round(d["x"]))
+            if not (0 <= cy < h_chip and 0 <= cx < w_chip) or vv[cy, cx] == 0:
+                continue
             lon, lat = tfm * (d["x"], d["y"])
             length = d.get("length_m")
             out.append(Detection(
