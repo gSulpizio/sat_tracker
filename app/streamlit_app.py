@@ -132,6 +132,47 @@ def relink_vessel(vessels: dict, edits: dict, dark_id: str, ais_id: str) -> None
     log_correction(edits, "RELINK", vessel_id=dark_id, mmsi=ais_v["mmsi"])
 
 
+def merge_vessels(vessels: dict, edits: dict, id_a: str, id_b: str) -> str:
+    """Merge two detections of the SAME physical ship (double counting from
+    chip-overlap seams, split radar blobs, …). Keeps the better one —
+    VERIFIED beats DARK, then an AIS identity, then detector confidence —
+    and folds the other in, preferring non-null attributes from the keeper.
+    Returns the surviving vessel id."""
+    a, b = vessels[id_a], vessels[id_b]
+
+    def rank(v):
+        det = v.get("detection") or {}
+        return (v["status"] == "VERIFIED", v.get("mmsi") is not None,
+                det.get("confidence") or 0)
+
+    keep, drop = (a, b) if rank(a) >= rank(b) else (b, a)
+    # Inherit anything the keeper lacks
+    if keep.get("mmsi") is None and drop.get("mmsi") is not None:
+        keep["mmsi"] = drop["mmsi"]
+        if drop["status"] == "VERIFIED":
+            keep["status"] = "VERIFIED"
+    kd, dd = keep.get("detection") or {}, drop.get("detection") or {}
+    for field in ("length_m", "width_m", "heading_deg", "obb"):
+        if kd.get(field) is None and dd.get(field) is not None:
+            kd[field] = dd[field]
+    vessels.pop(drop["id"])
+    log_correction(edits, "MERGE", kept=keep["id"], removed=drop["id"])
+    return keep["id"]
+
+
+def resize_vessel(vessels: dict, edits: dict, vessel_id: str,
+                  length_m: float, width_m: float) -> None:
+    """Analyst override of the estimated ship size — recorded in the audit
+    trail like every other correction."""
+    det = vessels[vessel_id].setdefault("detection", {})
+    log_correction(edits, "RESIZE", vessel_id=vessel_id,
+                   old_length_m=det.get("length_m"), new_length_m=length_m,
+                   old_width_m=det.get("width_m"), new_width_m=width_m)
+    det["length_m"] = round(length_m, 1)
+    det["width_m"] = round(width_m, 1)
+    det["size_manual"] = True
+
+
 def is_simulated(snap: dict) -> bool:
     return bool(snap.get("simulated")) or "SIM" in snap["scene"]["scene_id"]
 
@@ -820,9 +861,22 @@ def aoi_picker() -> None:
 
 
 # ----------------------------------------------------------------- map build
+#
+# Split so that clicking a marker doesn't feel like the app is reloading:
+# the BASE map (tiles + multi-MB SAR/S2 overlays) is built once per
+# (scene, layer settings) and cached in session state; the vessel markers
+# ride in a folium FeatureGroup passed via st_folium's feature_group_to_add,
+# which streamlit-folium re-renders WITHOUT re-sending the base map. The
+# whole map pane also runs inside a st.fragment, so a click reruns only
+# this pane instead of the entire app.
 
-def build_map(snap: dict, vessels: dict, show_sar: bool, show_s2: bool,
-              sar_opacity: float = 0.9) -> folium.Map:
+def get_base_map(snap: dict, show_sar: bool, show_s2: bool,
+                 sar_opacity: float) -> folium.Map:
+    key = (snap["scene"]["scene_id"], show_sar, show_s2, round(sar_opacity, 2))
+    cache = st.session_state.setdefault("_basemap_cache", {})
+    if key in cache:
+        return cache[key]
+
     snap_dir = load_user_settings().snapshots_dir  # active location's folder
     min_lon, min_lat, max_lon, max_lat = snap["scene"]["bbox"]
     m = folium.Map(
@@ -852,11 +906,14 @@ def build_map(snap: dict, vessels: dict, show_sar: bool, show_s2: bool,
                   f"{s2['cloud_cover']:.0f}% cloud)"),
         ).add_to(m)
 
-    groups = {
-        s: folium.FeatureGroup(name=STATUS_STYLE[s]["label"]).add_to(m)
-        for s in STATUS_STYLE
-    }
+    MiniMap(toggle_display=True).add_to(m)
+    cache.clear()          # keep at most one heavy map in memory
+    cache[key] = m
+    return m
 
+
+def build_vessel_group(vessels: dict) -> folium.FeatureGroup:
+    fg = folium.FeatureGroup(name="vessels")
     for v in vessels.values():
         style = STATUS_STYLE[v["status"]]
         det = v.get("detection") or {}
@@ -866,6 +923,8 @@ def build_map(snap: dict, vessels: dict, show_sar: bool, show_s2: bool,
                          f"{det.get('width_m') or 0:.0f} m")
             if det.get("heading_deg") is not None:
                 size_line += f" · axis {det['heading_deg']:.0f}°/{(det['heading_deg'] + 180) % 360:.0f}°"
+            if det.get("obb"):
+                size_line += "<br><i>outline = measured radar footprint</i>"
         popup_html = (
             f"<b>{v['id']}</b> — {style['label']}<br>"
             f"MMSI: {v.get('mmsi') or '—'}<br>"
@@ -884,19 +943,19 @@ def build_map(snap: dict, vessels: dict, show_sar: bool, show_s2: bool,
             fill_opacity=0.35,
             tooltip=vessel_label(v),
             popup=folium.Popup(popup_html, max_width=280),
-        ).add_to(groups[v["status"]])
+        ).add_to(fg)
 
+        # Measured radar footprint / detector OBB — the visual answer to
+        # "what did it actually measure for this size estimate?"
         if det.get("obb"):
             folium.Polygon(
                 locations=[[la, lo] for lo, la in det["obb"]],
                 color=style["color"],
                 weight=2,
                 fill=False,
-            ).add_to(groups[v["status"]])
-
-    folium.LayerControl(collapsed=False).add_to(m)
-    MiniMap(toggle_display=True).add_to(m)
-    return m
+                dash_array="4",
+            ).add_to(fg)
+    return fg
 
 
 # ------------------------------------------------------------------- UI body
@@ -1070,21 +1129,9 @@ if ta:
             f"{ta['pings_in_window']} pings usable."
         )
 
-# ---- analytics panel (recomputed live from the possibly-edited vessel set)
-n_ver = sum(1 for v in vessels.values() if v["status"] == "VERIFIED")
-n_dark = sum(1 for v in vessels.values() if v["status"] == "DARK")
-n_ais = sum(1 for v in vessels.values() if v["status"] == "AIS_ONLY")
-total_detected = n_ver + n_dark
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Total detected (SAR)", total_detected)
-c2.metric("AIS active", n_ver + n_ais)
-c3.metric("Verified", n_ver)
-c4.metric("Dark vessels", n_dark, delta=None if n_dark == 0 else "⚠ review")
-c5.metric(
-    "Dark fleet multiplier",
-    f"{(total_detected / n_ver):.2f}×" if n_ver else "—",
-    help="Radar-detected fleet size relative to the AIS-verified fleet",
-)
+# ---- analytics panel: placeholder here (top of page), filled after the
+# sidebar runs so it can respect the size/status filters defined there
+analytics_box = st.container()
 
 # --------------------------------------------------------------- sidebar HIL
 with st.sidebar:
@@ -1116,6 +1163,25 @@ with st.sidebar:
              "regardless.",
     )
 
+    st.header("Filters")
+    min_ship_len = st.number_input(
+        "Min ship length (m)", min_value=0, max_value=500, value=0, step=5,
+        help="Hide detections shorter than this from the map and the "
+             "analytics counts. 0 = show everything. Detections without a "
+             "size estimate stay visible regardless (unknown ≠ small), and "
+             "green AIS-only tracks are never filtered by size. Nothing is "
+             "deleted — clear the filter to see them again.",
+    )
+    fcols = st.columns(3)
+    show_status = {
+        "VERIFIED": fcols[0].checkbox("🔵", value=True, key="flt_verified",
+                                      help="Show verified targets (AIS + radar)."),
+        "AIS_ONLY": fcols[1].checkbox("🟢", value=True, key="flt_ais",
+                                      help="Show AIS-only tracks (broadcasting, not imaged)."),
+        "DARK": fcols[2].checkbox("🔴", value=True, key="flt_dark",
+                                  help="Show dark vessels (imaged, no AIS)."),
+    }
+
     st.header("Analyst tools")
     mode_click = st.radio(
         "Map click mode",
@@ -1125,11 +1191,9 @@ with st.sidebar:
              "DARK contact there. Use when you can see a ship in the SAR "
              "layer that the model failed to detect. Added contacts are "
              "recorded in the correction audit trail.\n\n"
-             "In either mode, clicking directly ON a marker selects it: a "
-             "DARK or VERIFIED target shows a 🗑 Delete button; a DARK "
-             "target also offers 🔗 Link to AIS track, which then asks you "
-             "to click the matching green (AIS-only) marker to complete "
-             "the link.",
+             "In either mode, clicking directly ON a marker selects it and "
+             "shows actions under the map: 🗑 Delete, 🔗 Link to AIS track "
+             "(dark targets), 🔀 Merge duplicate, and ✏️ size correction.",
     )
 
     st.divider()
@@ -1207,119 +1271,225 @@ def layer_info_panel(snap: dict, show_sar: bool, show_s2: bool) -> None:
         )
 
 
+# ------------------------------------------------------- filters + analytics
+
+def _passes_filters(v: dict) -> bool:
+    if not show_status.get(v["status"], True):
+        return False
+    if min_ship_len and v["status"] != "AIS_ONLY":
+        length = (v.get("detection") or {}).get("length_m")
+        if length is not None and length < min_ship_len:
+            return False  # unknown sizes stay visible: unknown ≠ small
+    return True
+
+
+visible_vessels = {k: v for k, v in vessels.items() if _passes_filters(v)}
+
+with analytics_box:
+    n_ver = sum(1 for v in visible_vessels.values() if v["status"] == "VERIFIED")
+    n_dark = sum(1 for v in visible_vessels.values() if v["status"] == "DARK")
+    n_ais = sum(1 for v in visible_vessels.values() if v["status"] == "AIS_ONLY")
+    total_detected = n_ver + n_dark
+    hidden = len(vessels) - len(visible_vessels)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total detected (SAR)", total_detected)
+    c2.metric("AIS active", n_ver + n_ais)
+    c3.metric("Verified", n_ver)
+    c4.metric("Dark vessels", n_dark, delta=None if n_dark == 0 else "⚠ review")
+    c5.metric(
+        "Dark fleet multiplier",
+        f"{(total_detected / n_ver):.2f}×" if n_ver else "—",
+        help="Radar-detected fleet size relative to the AIS-verified fleet",
+    )
+    if hidden:
+        st.caption(f"🔎 {hidden} target(s) hidden by the sidebar filters "
+                   "(size / status) — nothing is deleted.")
+
 # ------------------------------------------------------------------ map pane
 layer_info_panel(snap, show_sar, show_s2)
-fmap = build_map(snap, vessels, show_sar, show_s2, sar_opacity)
-map_state = st_folium(
-    fmap, height=640, use_container_width=True,
-    key=f"map_{snap['scene']['scene_id']}",
-    # Only sync clicks back to Python. By default st_folium reports every
-    # pan/zoom/bounds change too, which triggers a full Streamlit rerun (and
-    # a full re-embed of the SAR/S2 overlay images) on every drag — that
-    # round-trip is what makes panning feel frozen. Panning/zooming now stay
-    # entirely client-side in Leaflet. last_object_clicked_tooltip carries
-    # the tooltip text of whichever marker was clicked (markers are
-    # tooltipped with "id · status · mmsi") — that's how we know WHICH
-    # vessel a click was on, for the click-to-delete flow below.
-    returned_objects=["last_clicked", "last_object_clicked_tooltip"],
-)
 
-# Click-to-add: act once per distinct click coordinate
-clicked = map_state.get("last_clicked") if map_state else None
-if clicked and mode_click.startswith("Add") and clicked != edits["last_click"]:
-    edits["last_click"] = clicked
-    new_id = f"m{sum(1 for v in vessels if v.startswith('m')):03d}"
-    vessels[new_id] = {
-        "id": new_id,
-        "status": "DARK",
-        "lat": round(clicked["lat"], 6),
-        "lon": round(clicked["lng"], 6),
-        "mmsi": None,
-        "match_dist_m": None,
-        "manual": True,
-    }
-    log_correction(edits, "ADD", vessel_id=new_id, lat=clicked["lat"], lon=clicked["lng"])
-    st.rerun()
 
-# Click-to-select: clicking a marker surfaces delete/link actions right
-# here, instead of hunting through sidebar dropdowns.
-marker_tooltip = map_state.get("last_object_clicked_tooltip") if map_state else None
-if marker_tooltip and marker_tooltip != edits["last_marker_click"]:
-    edits["last_marker_click"] = marker_tooltip
-    st.session_state["_selected_marker_id"] = marker_tooltip.split(" · ")[0].strip()
-
-# Stale IDs (already deleted, or left over from a different pass) never
-# resolve to a real vessel — just drop them rather than erroring.
-selected_id = st.session_state.get("_selected_marker_id")
-if selected_id and selected_id not in vessels:
-    st.session_state["_selected_marker_id"] = None
-    selected_id = None
-link_source_id = st.session_state.get("_link_source_id")
-if link_source_id and link_source_id not in vessels:
-    st.session_state["_link_source_id"] = None
-    link_source_id = None
-
-if link_source_id:
-    src = vessels[link_source_id]
-    lc1, lc2 = st.columns([4, 1])
-    lc1.info(f"🔗 Linking **{vessel_label(src)}** — click a green "
-             "AIS-only marker on the map to complete the link.")
-    if lc2.button("Cancel linking", key="cancel_linking", use_container_width=True):
-        st.session_state["_link_source_id"] = None
-        st.session_state["_selected_marker_id"] = None
-        st.rerun()
-    elif selected_id and selected_id != link_source_id:
-        target = vessels[selected_id]
-        if target["status"] == "AIS_ONLY":
-            if st.button(
-                f"✔ Confirm: link {vessel_label(src)} ↔ {vessel_label(target)}",
-                key="confirm_link", use_container_width=True,
-                help="Merges these into one VERIFIED target carrying the "
-                     "AIS track's MMSI. Recorded in the audit trail.",
-            ):
-                relink_vessel(vessels, edits, link_source_id, selected_id)
-                st.session_state["_link_source_id"] = None
-                st.session_state["_selected_marker_id"] = None
-                st.rerun()
-        else:
-            st.warning(f"{vessel_label(target)} isn't an AIS-only (green) "
-                       "track — click a green marker to complete the link.")
-elif selected_id:
-    sv = vessels[selected_id]
-    style = STATUS_STYLE[sv["status"]]
-    can_delete = sv["status"] in ("DARK", "VERIFIED")
-    can_link = sv["status"] == "DARK" and any(
-        v["status"] == "AIS_ONLY" for v in vessels.values()
+@st.fragment
+def map_pane():
+    """Everything a marker click touches lives in this fragment: a click
+    reruns ONLY this block, and the heavy base map (tiles + SAR/S2
+    overlays) is cached and shipped once — so selecting a ship no longer
+    kicks off a whole-app 'loading' cycle. Actual data mutations (delete/
+    link/merge/add/resize) escalate to a full rerun on purpose, because
+    they change the analytics above."""
+    base = get_base_map(snap, show_sar, show_s2, sar_opacity)
+    fg = build_vessel_group(visible_vessels)
+    map_state = st_folium(
+        base, height=640, use_container_width=True,
+        key=f"map_{snap['scene']['scene_id']}",
+        feature_group_to_add=fg,
+        # Only sync clicks back to Python — pan/zoom stay client-side.
+        returned_objects=["last_clicked", "last_object_clicked_tooltip"],
     )
-    cols = st.columns([3] + [1] * (1 + can_delete + can_link))
-    cols[0].markdown(f"**Selected:** {vessel_label(sv)} — {style['label']}")
-    ci = 1
-    if can_delete:
-        if cols[ci].button(
-            "🗑 Delete", key="delete_selected_marker", use_container_width=True,
-            help="Remove this detection. A VERIFIED target's AIS track is "
-                 "kept as a green 'AIS only' marker, not deleted along with it.",
-        ):
-            delete_vessel(vessels, edits, selected_id)
-            st.session_state["_selected_marker_id"] = None
-            st.rerun()
-        ci += 1
-    if can_link:
-        if cols[ci].button(
-            "🔗 Link to AIS track", key="start_link", use_container_width=True,
-            help="This radar detection has no AIS match yet. Click this, "
-                 "then click the green (AIS-only) marker it should be "
-                 "paired with — e.g. a ship the matcher missed because it "
-                 "was just outside the distance gate or time window.",
-        ):
-            st.session_state["_link_source_id"] = selected_id
-            st.session_state["_selected_marker_id"] = None
-            st.rerun()
-        ci += 1
-    if cols[ci].button("Deselect", key="deselect_marker", use_container_width=True,
-                       help="Clear the selection without changing anything."):
+
+    # Click-to-add: act once per distinct click coordinate
+    clicked = map_state.get("last_clicked") if map_state else None
+    if clicked and mode_click.startswith("Add") and clicked != edits["last_click"]:
+        edits["last_click"] = clicked
+        new_id = f"m{sum(1 for v in vessels if v.startswith('m')):03d}"
+        vessels[new_id] = {
+            "id": new_id,
+            "status": "DARK",
+            "lat": round(clicked["lat"], 6),
+            "lon": round(clicked["lng"], 6),
+            "mmsi": None,
+            "match_dist_m": None,
+            "manual": True,
+        }
+        log_correction(edits, "ADD", vessel_id=new_id,
+                       lat=clicked["lat"], lon=clicked["lng"])
+        st.rerun(scope="app")
+
+    # Click-to-select: the marker tooltip identifies the vessel
+    marker_tooltip = map_state.get("last_object_clicked_tooltip") if map_state else None
+    if marker_tooltip and marker_tooltip != edits["last_marker_click"]:
+        edits["last_marker_click"] = marker_tooltip
+        st.session_state["_selected_marker_id"] = marker_tooltip.split(" · ")[0].strip()
+
+    # Stale IDs (already deleted, other pass, …) resolve to nothing — drop.
+    selected_id = st.session_state.get("_selected_marker_id")
+    if selected_id and selected_id not in vessels:
         st.session_state["_selected_marker_id"] = None
-        st.rerun()
+        selected_id = None
+    for key in ("_link_source_id", "_merge_source_id"):
+        if st.session_state.get(key) and st.session_state[key] not in vessels:
+            st.session_state[key] = None
+    link_source_id = st.session_state.get("_link_source_id")
+    merge_source_id = st.session_state.get("_merge_source_id")
+
+    def clear_selection():
+        for key in ("_selected_marker_id", "_link_source_id", "_merge_source_id"):
+            st.session_state[key] = None
+
+    if link_source_id:
+        src = vessels[link_source_id]
+        lc1, lc2 = st.columns([4, 1])
+        lc1.info(f"🔗 Linking **{vessel_label(src)}** — click a green "
+                 "AIS-only marker on the map to complete the link.")
+        if lc2.button("Cancel", key="cancel_linking", use_container_width=True,
+                      help="Abort linking; nothing changes."):
+            clear_selection()
+            st.rerun(scope="fragment")
+        elif selected_id and selected_id != link_source_id:
+            target = vessels[selected_id]
+            if target["status"] == "AIS_ONLY":
+                if st.button(
+                    f"✔ Confirm: link {vessel_label(src)} ↔ {vessel_label(target)}",
+                    key="confirm_link", use_container_width=True,
+                    help="Merges these into one VERIFIED target carrying the "
+                         "AIS track's MMSI. Recorded in the audit trail.",
+                ):
+                    relink_vessel(vessels, edits, link_source_id, selected_id)
+                    clear_selection()
+                    st.rerun(scope="app")
+            else:
+                st.warning(f"{vessel_label(target)} isn't an AIS-only (green) "
+                           "track — click a green marker to complete the link.")
+    elif merge_source_id:
+        src = vessels[merge_source_id]
+        mc1, mc2 = st.columns([4, 1])
+        mc1.info(f"🔀 Merging **{vessel_label(src)}** — click the duplicate "
+                 "detection (🔵/🔴 marker) it should be merged with.")
+        if mc2.button("Cancel", key="cancel_merge", use_container_width=True,
+                      help="Abort merging; nothing changes."):
+            clear_selection()
+            st.rerun(scope="fragment")
+        elif selected_id and selected_id != merge_source_id:
+            target = vessels[selected_id]
+            if target.get("detection") or target.get("manual"):
+                if st.button(
+                    f"✔ Confirm: merge {vessel_label(src)} + {vessel_label(target)}",
+                    key="confirm_merge", use_container_width=True,
+                    help="Treats these two markers as ONE physical ship "
+                         "(double counting happens on chip seams or split "
+                         "radar blobs). The stronger record survives — "
+                         "verified > has-AIS > higher confidence — and "
+                         "inherits the other's attributes. Recorded in the "
+                         "audit trail.",
+                ):
+                    merge_vessels(vessels, edits, merge_source_id, selected_id)
+                    clear_selection()
+                    st.rerun(scope="app")
+            else:
+                st.warning(f"{vessel_label(target)} is an AIS-only track — "
+                           "merging is for duplicate radar detections. Use "
+                           "🔗 Link for detection↔AIS pairing.")
+    elif selected_id:
+        sv = vessels[selected_id]
+        style = STATUS_STYLE[sv["status"]]
+        det = sv.get("detection")
+        can_delete = sv["status"] in ("DARK", "VERIFIED")
+        can_link = sv["status"] == "DARK" and any(
+            v["status"] == "AIS_ONLY" for v in vessels.values())
+        can_merge = bool(det or sv.get("manual"))
+        n_btns = 1 + can_delete + can_link + can_merge + bool(det)
+        cols = st.columns([3] + [1] * n_btns)
+        cols[0].markdown(f"**Selected:** {vessel_label(sv)} — {style['label']}")
+        ci = 1
+        if can_delete:
+            if cols[ci].button(
+                "🗑 Delete", key="delete_selected_marker", use_container_width=True,
+                help="Remove this detection. A VERIFIED target's AIS track is "
+                     "kept as a green 'AIS only' marker, not deleted with it.",
+            ):
+                delete_vessel(vessels, edits, selected_id)
+                clear_selection()
+                st.rerun(scope="app")
+            ci += 1
+        if can_link:
+            if cols[ci].button(
+                "🔗 Link", key="start_link", use_container_width=True,
+                help="Pair this unmatched radar detection with an AIS track: "
+                     "click this, then click the green (AIS-only) marker it "
+                     "belongs to.",
+            ):
+                st.session_state["_link_source_id"] = selected_id
+                st.session_state["_selected_marker_id"] = None
+                st.rerun(scope="fragment")
+            ci += 1
+        if can_merge:
+            if cols[ci].button(
+                "🔀 Merge", key="start_merge", use_container_width=True,
+                help="This ship was counted twice? Click this, then click "
+                     "the duplicate marker — the two records merge into one.",
+            ):
+                st.session_state["_merge_source_id"] = selected_id
+                st.session_state["_selected_marker_id"] = None
+                st.rerun(scope="fragment")
+            ci += 1
+        if det:
+            with cols[ci].popover("✏️ Size", use_container_width=True,
+                                  help="Correct the estimated ship size. The "
+                                       "dashed outline on the map shows the "
+                                       "radar footprint the estimate came "
+                                       "from — if it grabbed a sidelobe or "
+                                       "merged two hulls, fix the numbers "
+                                       "here (recorded in the audit trail)."):
+                new_len = st.number_input(
+                    "Length (m)", min_value=5.0, max_value=500.0,
+                    value=float(det.get("length_m") or 50.0), step=5.0,
+                    key="resize_len")
+                new_beam = st.number_input(
+                    "Beam (m)", min_value=2.0, max_value=80.0,
+                    value=float(det.get("width_m") or 15.0), step=1.0,
+                    key="resize_beam")
+                if st.button("Save size", key="resize_save"):
+                    resize_vessel(vessels, edits, selected_id, new_len, new_beam)
+                    st.rerun(scope="app")
+            ci += 1
+        if cols[ci].button("Deselect", key="deselect_marker",
+                           use_container_width=True,
+                           help="Clear the selection without changing anything."):
+            clear_selection()
+            st.rerun(scope="fragment")
+
+
+map_pane()
 
 if edits["corrections"]:
     with st.expander(f"Correction audit trail ({len(edits['corrections'])})"):

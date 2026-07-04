@@ -45,6 +45,9 @@ class SizeEstimate:
     width_m: float
     heading_deg: float
     reliable: bool      # False when the blob touches the chip edge etc.
+    # Oriented footprint rectangle [(lon, lat) × 4] of the measured radar
+    # blob — lets the UI show exactly WHAT was measured, not just numbers.
+    corners_lonlat: list[tuple[float, float]] | None = None
 
 
 def measure_detections(asset_hrefs: list[str], detections: list,
@@ -64,7 +67,10 @@ def measure_detections(asset_hrefs: list[str], detections: list,
 
     measured = 0
     for href in asset_hrefs:
-        todo = [d for d in detections if d.length_m is None]
+        # heading is the "already measured" marker: detections may arrive
+        # with a model-estimated length (kept authoritative) but still get
+        # their footprint geometry measured here for visualization.
+        todo = [d for d in detections if d.heading_deg is None]
         if not todo:
             break
         try:
@@ -81,9 +87,12 @@ def measure_detections(asset_hrefs: list[str], detections: list,
                         for det in todo:
                             est = _measure_one(vrt, det.lon, det.lat)
                             if est is not None and est.reliable:
-                                det.length_m = round(est.length_m, 1)
+                                if det.length_m is None:
+                                    det.length_m = round(est.length_m, 1)
                                 det.width_m = round(est.width_m, 1)
                                 det.heading_deg = round(est.heading_deg, 1)
+                                if est.corners_lonlat and not det.obb_lonlat:
+                                    det.obb_lonlat = est.corners_lonlat
                                 measured += 1
                     finally:
                         if vrt is not src:
@@ -159,4 +168,20 @@ def _measure_one(vrt, lon: float, lat: float) -> SizeEstimate | None:
     touches_edge = (ys.min() == 0 or xs.min() == 0
                     or ys.max() == CHIP_PX - 1 or xs.max() == CHIP_PX - 1)
     reliable = not touches_edge and length <= MAX_SHIP_M
-    return SizeEstimate(length, width, heading, reliable)
+
+    # Oriented footprint rectangle in geographic coords: centre of the blob
+    # ± half-extents along the principal axes, converted metre→pixel→lonlat.
+    cy_blob = float(ys.mean())
+    cx_blob = float(xs.mean())
+    mid_major = (proj_major.max() + proj_major.min()) / 2
+    mid_minor = (proj_minor.max() + proj_minor.min()) / 2
+    corners = []
+    for sa, sb in ((-1, -1), (-1, 1), (1, 1), (1, -1)):
+        off_m = ((mid_major + sa * length / 2) * major
+                 + (mid_minor + sb * width / 2) * minor)  # metres (x, y)
+        px = cx_blob + off_m[0] / mpp_x
+        py = cy_blob + off_m[1] / mpp_y
+        glon, glat = vrt.transform * (c0 + px, r0 + py)
+        corners.append((round(glon, 6), round(glat, 6)))
+
+    return SizeEstimate(length, width, heading, reliable, corners)
