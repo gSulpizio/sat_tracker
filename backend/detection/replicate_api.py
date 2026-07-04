@@ -1,21 +1,30 @@
 """Replicate-hosted detector backend — xView3 2nd-place TimmUnet.
 
-Talks to the model WE package and push via Cog (replicate_xview3/ in this
-repo), so the I/O contract is fixed:
+Talks to the model packaged in replicate_xview3/ (same package behind the
+public gsulpizio/xview3-vessel-detect deployment). The client uploads
+raw-amplitude 2-band float32 TIFF chips — identical to what any public
+user would send — and the predictor owns all preprocessing. Two extra
+inputs ride along:
 
-    input:  chip = .npz file with float32 'vv_db'/'vh_db' (sigma0 dB,
-            native ~10 m/px), confidence = center threshold (0..255)
-    output: {"detections": [{"y","x","score","is_vessel","length_m"}, ...]}
+    pixel_spacing_m   exact ground sampling of this (warped) chip, so the
+                      model's length regression is scaled correctly
+    vv_anchor_db      the frame's water level in raw dB (p30 of a
+                      decimated whole-frame read) — feeds the predictor's
+                      land-clutter test with an absolute reference that a
+                      wall-to-wall-city chip can't fool; detection itself
+                      always uses per-chip anchoring
 
 Unlike the Roboflow backend (which tiles the decimated display image),
 this one re-reads NATIVE-resolution VV+VH windows from the source COGs —
 the xView3 model was trained on native 10 m pixels and both polarizations,
-and it also regresses vessel length directly, which the pipeline carries
-into the UI.
+and it regresses vessel length directly, which the pipeline carries into
+the UI. Detections centred on nodata are rejected on both sides (ships
+can't be where the radar didn't image).
 
 Replicate bills per second with scale-to-zero: for a bursty on-demand
 pipeline (tens of CPU chips per pass, a few passes a week) that's cents
-per month; cold starts of ~10–30 s don't matter here.
+per month. The first chip of each pass runs serially to absorb the cold
+start; transient API 502s are retried with backoff.
 """
 from __future__ import annotations
 
