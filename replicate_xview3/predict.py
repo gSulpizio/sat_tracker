@@ -112,19 +112,36 @@ def _quicklook_to_db(gray: np.ndarray) -> np.ndarray:
 
 
 def _load_bands(path: str) -> tuple[np.ndarray, np.ndarray | None, str, bool]:
-    """→ (vv_raw, vh_raw or None, source description, is_quicklook)."""
-    lower = path.lower()
-    if lower.endswith(".npz"):
-        d = np.load(path)
-        return (d["vv_db"].astype("float32"), d["vh_db"].astype("float32"),
-                "npz (pre-computed dB)", False)
-    if lower.endswith((".tif", ".tiff")):
-        import tifffile
+    """→ (vv_raw, vh_raw or None, source description, is_quicklook).
 
+    Detection is by CONTENT, never by filename: files arrive through
+    Replicate's Files API under extension-less download URLs, so an
+    extension check silently routed float32 2-band TIFFs into the PIL
+    quicklook branch (page 1 only, clipped to 8-bit, VH synthesized) —
+    degrading every prediction while still 'working'. Sniff instead.
+    """
+    # 1) npz with our known keys?
+    try:
+        d = np.load(path)
+        if hasattr(d, "files") and "vv_db" in d.files:
+            return (d["vv_db"].astype("float32"), d["vh_db"].astype("float32"),
+                    "npz (pre-computed dB)", False)
+    except Exception:
+        pass
+    # 2) TIFF? tifffile reads by magic bytes, keeps dtype and all pages.
+    # (Read attempt kept separate from shape handling: TiffFileError
+    # subclasses ValueError, so a combined try-block can't distinguish
+    # "not a TIFF, try PIL" from "TIFF with an unsupported layout".)
+    import tifffile
+
+    try:
         arr = np.asarray(tifffile.imread(path))
+    except Exception:
+        arr = None
+    if arr is not None:
         quicklook = arr.dtype == np.uint8
         if arr.ndim == 2:
-            return arr, None, "single-band TIFF", quicklook
+            return arr, None, f"single-band TIFF ({arr.dtype})", quicklook
         if arr.ndim == 3:
             # accept (C,H,W) or (H,W,C)
             if arr.shape[0] <= 4 and arr.shape[0] < arr.shape[-1]:
@@ -132,12 +149,15 @@ def _load_bands(path: str) -> tuple[np.ndarray, np.ndarray | None, str, bool]:
             else:
                 bands = [arr[..., i] for i in range(arr.shape[-1])]
             vh = bands[1] if len(bands) > 1 else None
-            return bands[0], vh, f"{len(bands)}-band TIFF", quicklook
+            return (bands[0], vh, f"{len(bands)}-band TIFF ({arr.dtype})",
+                    quicklook)
         raise ValueError(f"Unsupported TIFF shape {arr.shape}")
-    # PNG/JPEG quicklook
+    # 3) PNG/JPEG quicklook via PIL
     from PIL import Image
 
     img = Image.open(path)
+    if img.mode == "F":  # float TIFF that tifffile couldn't parse
+        return np.asarray(img).astype("float32"), None, "float image (PIL)", False
     if img.mode == "LA":  # legacy 2-channel (VV in L, VH in A)
         arr = np.asarray(img).astype("float32")
         return arr[..., 0], arr[..., 1], "LA PNG", True
