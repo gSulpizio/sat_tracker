@@ -184,17 +184,19 @@ class Predictor(BasePredictor):
                         "off — turn on for harbour analysis."),
         vv_anchor_db: Optional[float] = Input(
             default=None,
-            description="Advanced: scene-level VV calibration anchor (the "
-                        "raw-dB value that corresponds to calm sea, e.g. the "
-                        "30th percentile over a mostly-water region of the "
-                        "full scene). Without it, each chip self-anchors — "
-                        "which mis-calibrates chips that are mostly land "
-                        "(a city gets normalized down to 'sea level' and "
-                        "its buildings light up as ships)."),
+            description="Advanced: the raw-dB value corresponding to open "
+                        "water at FULL-SCENE scale (e.g. p30 over the whole "
+                        "scene). Used only by the land-clutter test as an "
+                        "absolute water reference — a chip that is mostly "
+                        "city self-normalizes its rooftops to 'sea level', "
+                        "which would otherwise blind the land filter. Model "
+                        "detection itself always uses per-chip anchoring "
+                        "(more robust: sea state varies several dB between "
+                        "basins of one scene)."),
         vh_anchor_db: Optional[float] = Input(
             default=None,
-            description="Advanced: scene-level VH calibration anchor "
-                        "(see vv_anchor_db)."),
+            description="Reserved for symmetry with vv_anchor_db; currently "
+                        "unused (the land test runs on VV)."),
     ) -> dict:
         vv_raw, vh_raw, source, quicklook = _load_bands(str(image))
 
@@ -211,27 +213,29 @@ class Predictor(BasePredictor):
         nodata = (vv_raw == 0) if (vv_kind.startswith("amplitude") or quicklook) \
             else ~np.isfinite(vv_raw)
         vv_db[nodata] = -100.0
+        # Model input is ALWAYS per-chip anchored — detection runs on local
+        # contrast and this is the empirically proven path. The scene-level
+        # anchor (if given) feeds ONLY the land-clutter test below: it maps
+        # this chip into an absolute frame where open water ≈ -20.5 dB even
+        # when the chip itself is wall-to-wall city (per-chip anchoring
+        # would normalize rooftops to sea level and blind the land test).
+        vv_land = vv_db.copy()
         if vv_anchor_db is not None:
-            # Scene-level anchor from the caller — immune to chips that
-            # are mostly land (per-chip anchoring would normalize a city
-            # down to sea level and light its buildings up as ships).
-            valid = vv_db > -99
-            vv_db[valid] = vv_db[valid] - (vv_anchor_db - SEA_VV_DB)
-            anchor_kind = "scene-level anchors (caller-provided)"
+            validl = vv_land > -99
+            vv_land[validl] = vv_land[validl] - (vv_anchor_db - SEA_VV_DB)
+            anchor_kind = "per-chip (model) + scene-level (land test)"
         else:
-            vv_db = _anchor(vv_db, SEA_VV_DB)
-            anchor_kind = f"per-chip p{SEA_PCTL} anchor"
+            anchor_kind = f"per-chip p{SEA_PCTL} anchor (model and land test)"
+        vv_db = _anchor(vv_db, SEA_VV_DB)
+        if vv_anchor_db is None:
+            vv_land = vv_db
 
         if vh_raw is not None:
             vh_db = (_quicklook_to_db(vh_raw) if quicklook
                      else _to_db(vh_raw)[0])
             vh_db[nodata] = -100.0
             vh_db[vh_raw == 0] = -100.0
-            if vh_anchor_db is not None:
-                validh = vh_db > -99
-                vh_db[validh] = vh_db[validh] - (vh_anchor_db - SEA_VH_DB)
-            else:
-                vh_db = _anchor(vh_db, SEA_VH_DB)
+            vh_db = _anchor(vh_db, SEA_VH_DB)
             pol = "dual-pol (VV+VH)"
         else:
             vh_db = vv_db - VV_MINUS_VH_DB
@@ -263,7 +267,7 @@ class Predictor(BasePredictor):
             x0, x1 = max(0, cx - 3), min(w_img, cx + 4)
             if nodata[y0:y1, x0:x1].mean() > 0.5:
                 continue
-            on_land = _bright_background(vv_db, nodata, cy, cx)
+            on_land = _bright_background(vv_land, nodata, cy, cx)
             if on_land and not include_land_targets:
                 n_land += 1
                 continue

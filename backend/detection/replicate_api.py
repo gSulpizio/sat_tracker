@@ -35,6 +35,31 @@ log = logging.getLogger(__name__)
 
 API_ROOT = "https://api.replicate.com/v1"
 
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _request_retrying(method: str, url: str, attempts: int = 4, **kwargs):
+    """Replicate's API throws intermittent 502s under load (observed: three
+    of five passes lost to single Bad Gateways). Retry transient failures
+    with exponential backoff. A retried prediction-create can in principle
+    double-bill one chip (~$0.001) — losing a whole pass costs more.
+    """
+    import requests
+
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            resp = requests.request(method, url, **kwargs)
+            if resp.status_code not in RETRY_STATUSES:
+                return resp
+            last_exc = requests.HTTPError(
+                f"{resp.status_code} from {url.split('?')[0]}")
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last_exc = exc
+        if attempt < attempts - 1:
+            time.sleep(3 * 2 ** attempt)
+    raise last_exc  # type: ignore[misc]
+
 CHIP = 800            # matches the shard size the model was trained on
 STRIDE = 704          # 96 px overlap so ships on seams aren't cut
 CONFIDENCE = 100.0    # center-head threshold the original solution used
@@ -68,7 +93,7 @@ class ReplicateDetector(VesselDetector):
             return self._version
         import requests
 
-        r = requests.get(f"{API_ROOT}/models/{self.model}",
+        r = _request_retrying("GET", f"{API_ROOT}/models/{self.model}",
                          headers={"Authorization": f"Bearer {self.api_token}"},
                          timeout=30)
         if r.status_code == 404:
@@ -164,8 +189,8 @@ class ReplicateDetector(VesselDetector):
         buf = io.BytesIO()
         tifffile.imwrite(buf, np.stack([vv, vh]).astype("float32"))
         buf.seek(0)
-        resp = requests.post(
-            f"{API_ROOT}/files",
+        resp = _request_retrying(
+            "POST", f"{API_ROOT}/files",
             headers={"Authorization": f"Bearer {self.api_token}"},
             files={"content": ("chip.tif", buf, "image/tiff")},
             timeout=120,
@@ -188,8 +213,8 @@ class ReplicateDetector(VesselDetector):
         mpp_y = abs(tfm.e) * 110_540.0
         pixel_spacing = round((mpp_x + mpp_y) / 2, 2)
 
-        resp = requests.post(
-            f"{API_ROOT}/predictions",
+        resp = _request_retrying(
+            "POST", f"{API_ROOT}/predictions",
             headers={"Authorization": f"Bearer {self.api_token}",
                      "Prefer": "wait=60"},
             json={"version": self._latest_version(),
@@ -215,7 +240,7 @@ class ReplicateDetector(VesselDetector):
                     f"Replicate prediction {pred.get('id')} still "
                     f"'{pred['status']}' after 5 min.")
             time.sleep(3)
-            poll = requests.get(pred["urls"]["get"],
+            poll = _request_retrying("GET", pred["urls"]["get"],
                                 headers={"Authorization": f"Bearer {self.api_token}"},
                                 timeout=30)
             poll.raise_for_status()
