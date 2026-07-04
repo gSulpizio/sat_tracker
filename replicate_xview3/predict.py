@@ -30,6 +30,8 @@ length in metres) plus an annotated PNG for instant visual feedback.
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 import torch
 from cog import BasePredictor, Input, Path
@@ -180,6 +182,19 @@ class Predictor(BasePredictor):
                         "cities trigger many false 'ships'. Ships moored "
                         "directly against piers are also suppressed when "
                         "off — turn on for harbour analysis."),
+        vv_anchor_db: Optional[float] = Input(
+            default=None,
+            description="Advanced: scene-level VV calibration anchor (the "
+                        "raw-dB value that corresponds to calm sea, e.g. the "
+                        "30th percentile over a mostly-water region of the "
+                        "full scene). Without it, each chip self-anchors — "
+                        "which mis-calibrates chips that are mostly land "
+                        "(a city gets normalized down to 'sea level' and "
+                        "its buildings light up as ships)."),
+        vh_anchor_db: Optional[float] = Input(
+            default=None,
+            description="Advanced: scene-level VH calibration anchor "
+                        "(see vv_anchor_db)."),
     ) -> dict:
         vv_raw, vh_raw, source, quicklook = _load_bands(str(image))
 
@@ -196,14 +211,27 @@ class Predictor(BasePredictor):
         nodata = (vv_raw == 0) if (vv_kind.startswith("amplitude") or quicklook) \
             else ~np.isfinite(vv_raw)
         vv_db[nodata] = -100.0
-        vv_db = _anchor(vv_db, SEA_VV_DB)
+        if vv_anchor_db is not None:
+            # Scene-level anchor from the caller — immune to chips that
+            # are mostly land (per-chip anchoring would normalize a city
+            # down to sea level and light its buildings up as ships).
+            valid = vv_db > -99
+            vv_db[valid] = vv_db[valid] - (vv_anchor_db - SEA_VV_DB)
+            anchor_kind = "scene-level anchors (caller-provided)"
+        else:
+            vv_db = _anchor(vv_db, SEA_VV_DB)
+            anchor_kind = f"per-chip p{SEA_PCTL} anchor"
 
         if vh_raw is not None:
             vh_db = (_quicklook_to_db(vh_raw) if quicklook
                      else _to_db(vh_raw)[0])
             vh_db[nodata] = -100.0
             vh_db[vh_raw == 0] = -100.0
-            vh_db = _anchor(vh_db, SEA_VH_DB)
+            if vh_anchor_db is not None:
+                validh = vh_db > -99
+                vh_db[validh] = vh_db[validh] - (vh_anchor_db - SEA_VH_DB)
+            else:
+                vh_db = _anchor(vh_db, SEA_VH_DB)
             pol = "dual-pol (VV+VH)"
         else:
             vh_db = vv_db - VV_MINUS_VH_DB
@@ -256,7 +284,7 @@ class Predictor(BasePredictor):
             "preprocessing": {
                 "source": source, "vv_interpretation": vv_kind,
                 "polarization": pol,
-                "sea_anchor_percentile": SEA_PCTL,
+                "calibration": anchor_kind,
                 "land_clutter_suppressed": n_land,
             },
             "height": h, "width": w,

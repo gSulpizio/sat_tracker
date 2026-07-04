@@ -120,6 +120,15 @@ class ReplicateDetector(VesselDetector):
                             ).round_offsets().round_lengths()
                         except WindowError:
                             continue
+                        # Scene-level calibration anchors, computed ONCE per
+                        # frame from a decimated read of the whole AOI∩frame
+                        # window. At scene scale water is a large fraction,
+                        # so the 30th percentile lands in water — per-CHIP
+                        # anchoring broke on land-dominated chips (a city
+                        # got normalized to sea level and its buildings lit
+                        # up as ships; observed on the Istanbul AOI).
+                        vv_anchor, vh_anchor = _frame_anchors(
+                            vv_vrt, vh_vrt, win)
                         for r0 in range(int(win.row_off),
                                         int(win.row_off + win.height), STRIDE):
                             for c0 in range(int(win.col_off),
@@ -136,6 +145,8 @@ class ReplicateDetector(VesselDetector):
                                                  out_dtype="float32")
                                 chips.append({
                                     "vv": vv, "vh": vh,
+                                    "vv_anchor": vv_anchor,
+                                    "vh_anchor": vh_anchor,
                                     "transform": vv_vrt.window_transform(
                                         Window(c0, r0, w, h)),
                                 })
@@ -183,7 +194,11 @@ class ReplicateDetector(VesselDetector):
                      "Prefer": "wait=60"},
             json={"version": self._latest_version(),
                   "input": {"image": file_url, "confidence": CONFIDENCE,
-                            "pixel_spacing_m": pixel_spacing}},
+                            "pixel_spacing_m": pixel_spacing,
+                            **({"vv_anchor_db": chip["vv_anchor"]}
+                               if chip.get("vv_anchor") is not None else {}),
+                            **({"vh_anchor_db": chip["vh_anchor"]}
+                               if chip.get("vh_anchor") is not None else {})}},
             timeout=90,
         )
         if resp.status_code == 402:
@@ -193,7 +208,7 @@ class ReplicateDetector(VesselDetector):
         resp.raise_for_status()
         pred = resp.json()
 
-        deadline = time.monotonic() + 300  # allow for a cold start
+        deadline = time.monotonic() + 600  # cold starts can exceed 5 min
         while pred.get("status") in ("starting", "processing"):
             if time.monotonic() > deadline:
                 raise TimeoutError(
@@ -237,8 +252,13 @@ class ReplicateDetector(VesselDetector):
         chips = self._collect_chips(scene)
         log.info("Replicate: %d native-res chips to infer", len(chips))
         all_dets: list[Detection] = []
+        if chips:
+            # First chip runs alone to absorb the cold start — firing four
+            # parallel requests at a cold model spawns several instances
+            # that each boot for minutes (observed: timeout at 5 min).
+            all_dets.extend(self._predict_chip(chips[0]))
         with ThreadPoolExecutor(max_workers=4) as pool:
-            for dets in pool.map(self._predict_chip, chips):
+            for dets in pool.map(self._predict_chip, chips[1:]):
                 all_dets.extend(dets)
 
         # Cross-chip/frame dedupe on ground distance
@@ -249,6 +269,26 @@ class ReplicateDetector(VesselDetector):
         log.info("Replicate: %d detections after dedupe (%d raw)",
                  len(kept), len(all_dets))
         return kept
+
+
+def _frame_anchors(vv_vrt, vh_vrt, win) -> tuple[float | None, float | None]:
+    """Raw-dB values corresponding to calm sea, from decimated whole-window
+    reads — passed to the predictor as scene-level calibration anchors."""
+    from rasterio.windows import Window
+
+    out = []
+    for vrt in (vv_vrt, vh_vrt):
+        dec_h = max(1, min(512, int(win.height)))
+        dec_w = max(1, min(512, int(win.width)))
+        dec = vrt.read(1, window=win, out_shape=(dec_h, dec_w),
+                       out_dtype="float32")
+        valid = dec[dec > 0]
+        if valid.size < 500:
+            out.append(None)
+        else:
+            out.append(round(float(np.percentile(
+                20.0 * np.log10(np.maximum(valid, 1.0)), 30)), 2))
+    return out[0], out[1]
 
 
 def _to_4326(src, WarpedVRT):
