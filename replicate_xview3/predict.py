@@ -262,13 +262,33 @@ class Predictor(BasePredictor):
             vh_db[nodata] = -100.0
             pol = "single-pol (VH synthesized from VV — reduced accuracy)"
 
-        x = torch.from_numpy(
-            np.stack([_normalize(vv_db), _normalize(vh_db)]))[None].float()
+        h_orig, w_orig = vv_db.shape
+        if min(h_orig, w_orig) < 64:
+            raise ValueError(
+                f"Input is {w_orig}×{h_orig} px — too small. Provide at "
+                "least 64×64 (≈0.6×0.6 km at Sentinel-1 resolution).")
+        if max(h_orig, w_orig) > 4096:
+            raise ValueError(
+                f"Input is {w_orig}×{h_orig} px — too large for one pass "
+                "on CPU hardware. Tile it into chips of ≤4096 px per side "
+                "(800×800 recommended) and submit them separately.")
+
+        # The UNet needs H and W divisible by 32 (five stride-2 encoder
+        # stages); arbitrary uploads otherwise crash the skip connections
+        # ("Expected size 30 but got size 29"). Pad with normalized nodata
+        # and crop every output head back afterwards.
+        pad_h = (-h_orig) % 32
+        pad_w = (-w_orig) % 32
+        vv_n = np.pad(_normalize(vv_db), ((0, pad_h), (0, pad_w)))
+        vh_n = np.pad(_normalize(vh_db), ((0, pad_h), (0, pad_w)))
+
+        x = torch.from_numpy(np.stack([vv_n, vh_n]))[None].float()
         with torch.no_grad():
             out = self.model(x)
-        center = out["center_mask"][0, 0].numpy()
-        vessel = torch.sigmoid(out["vessel_mask"][0, 0]).numpy() * 255
-        length = out["length_mask"][0, 0].numpy()
+        center = out["center_mask"][0, 0].numpy()[:h_orig, :w_orig]
+        vessel = (torch.sigmoid(out["vessel_mask"][0, 0]).numpy()
+                  * 255)[:h_orig, :w_orig]
+        length = out["length_mask"][0, 0].numpy()[:h_orig, :w_orig]
 
         length_scale = pixel_spacing_m / 10.0
         labeled, n = ndlabel(binary_dilation(center > confidence))

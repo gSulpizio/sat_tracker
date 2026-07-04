@@ -1,0 +1,37 @@
+# Builds the replicate_xview3/ Cog package and pushes it to Replicate —
+# from GitHub's runners, so no local Docker or specific machine is needed.
+# Trigger manually (Actions tab → "Push model to Replicate" → Run) or via
+# `gh workflow run push-model.yml`. Requires the repository secret
+# REPLICATE_API_TOKEN (Settings → Secrets → Actions).
+name: Push model to Replicate
+
+on:
+  workflow_dispatch:
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download model weights (official xView3 2nd-place release)
+        run: |
+          curl -L --fail -o replicate_xview3/model.bin \
+            https://github.com/selimsef/xview3_solution/releases/download/weights/val_only_TimmUnet_resnet34_77_xview
+          ls -la replicate_xview3/model.bin
+
+      - name: Install cog
+        run: |
+          sudo curl -L --fail -o /usr/local/bin/cog \
+            https://github.com/replicate/cog/releases/latest/download/cog_linux_x86_64
+          sudo chmod +x /usr/local/bin/cog
+          cog --version
+
+      - name: Log in to r8.im
+        run: |
+          echo "${{ secrets.REPLICATE_API_TOKEN }}" | \
+            docker login r8.im -u gsulpizio --password-stdin
+
+      - name: Build and push
+        working-directory: replicate_xview3
+        run: cog push r8.im/gsulpizio/xview3-vessel-detect
