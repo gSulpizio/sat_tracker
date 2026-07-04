@@ -18,8 +18,13 @@
 #                     so the auth gate can't be bypassed from the LAN.
 #
 # Quick start:  docker compose up -d --build  →  http://localhost:8501
+# Both services default to the prebuilt image from GHCR (published by
+# .github/workflows/build-image.yml on every push to main) — an updater
+# like Watchtower then keeps deployments current automatically. To build
+# locally instead: docker compose up -d --build (build wins over image).
 services:
   sat-tracker:
+    image: ghcr.io/gsulpizio/sat_tracker:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -46,6 +51,7 @@ services:
       start_period: 30s
 
   sat-tracker-collector:
+    image: ghcr.io/gsulpizio/sat_tracker:latest
     build:
       context: .
       dockerfile: Dockerfile
