@@ -1,12 +1,15 @@
 # Builds the replicate_xview3/ Cog package and pushes it to Replicate —
 # from GitHub's runners, so no local Docker or specific machine is needed.
-# Trigger manually (Actions tab → "Push model to Replicate" → Run) or via
-# `gh workflow run push-model.yml`. Requires the repository secret
+# Trigger by pushing a tag like model-v8, or manually (Actions tab →
+# "Push model to Replicate" → Run). Requires the repository secret
 # REPLICATE_API_TOKEN (Settings → Secrets → Actions).
 name: Push model to Replicate
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - "model-v*"
 
 jobs:
   push:
