@@ -872,11 +872,11 @@ def aoi_picker() -> None:
 
 def get_base_map(snap: dict, show_sar: bool, show_s2: bool,
                  sar_opacity: float) -> folium.Map:
-    key = (snap["scene"]["scene_id"], show_sar, show_s2, round(sar_opacity, 2))
-    cache = st.session_state.setdefault("_basemap_cache", {})
-    if key in cache:
-        return cache[key]
-
+    # Built FRESH on every (fragment) rerun — never cache folium objects:
+    # rendering mutates them, and re-rendering a cached Map across reruns
+    # accumulates broken HTML until the component blanks out entirely.
+    # streamlit-folium doesn't re-render an unchanged-key base map in the
+    # browser anyway; only the feature_group_to_add layer updates.
     snap_dir = load_user_settings().snapshots_dir  # active location's folder
     min_lon, min_lat, max_lon, max_lat = snap["scene"]["bbox"]
     m = folium.Map(
@@ -907,8 +907,6 @@ def get_base_map(snap: dict, show_sar: bool, show_s2: bool,
         ).add_to(m)
 
     MiniMap(toggle_display=True).add_to(m)
-    cache.clear()          # keep at most one heavy map in memory
-    cache[key] = m
     return m
 
 
